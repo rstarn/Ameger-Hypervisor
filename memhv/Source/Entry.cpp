@@ -1,6 +1,6 @@
 #include "Global.h"
 
-EXTERN_C bool Utils::GetOffsets()
+bool Utils::GetOffsets()
 {
     UNICODE_STRING stringPsGetProcessId;
     RtlInitUnicodeString(&stringPsGetProcessId, L"PsGetProcessId");
@@ -100,11 +100,21 @@ EXTERN_C NTSTATUS Entry()
     if (!Utils::GetOffsets())
         return STATUS_PROCEDURE_NOT_FOUND;
 
+    Global::Offsets::Resolved = true;
+
+    //
+    // Dynamically resolve the Ob* reference/dereference routines and the
+    // MmGetPhysicalMemoryRanges export so that no hardcoded kernel offsets
+    // remain.  Refuses to load if resolution fails.
+    //
+    if (!Utils::InitObjectFunctions())
+        return STATUS_PROCEDURE_NOT_FOUND;
+
     //
     // Read the user/kernel boundary from this kernel's MmHighestUserAddress
     // export (64-bit user space on this Win11 24H2 build).
     //
-    Global::HighestUserAddress = MmHighestUserAddress;
+    Global::HighestUserAddress = reinterpret_cast<ULONG64>(MmHighestUserAddress);
 
     //
     // Resolve the MSR permission-map geometry for this CPU from CPUID

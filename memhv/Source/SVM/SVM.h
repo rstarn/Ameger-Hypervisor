@@ -14,4 +14,10 @@ namespace SVM
     void PrepareForVirtualization(PVIRTUAL_PROCESSOR_DATA vpData, PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData, const PCONTEXT contextRecord);
     NTSTATUS VirtualizeProcessor(PVOID context);
     void VirtualizeAllProcessors(PVOID);
+
+    //
+    // Extracts the segment limit for the given selector by looking up the
+    // descriptor in the GDT whose base is gdtBase.  The limit is returned
+    // as a flat byte count (granularity already applied).
+    ULONG GetSegmentLimit(UINT16 segmentSelector, ULONG_PTR gdtBase);
 }

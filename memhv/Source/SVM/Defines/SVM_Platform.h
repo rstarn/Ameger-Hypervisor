@@ -33,7 +33,11 @@
 
 #define SVM_VM_CR_SVMDIS                                            (1UL << 4)
 
-#define SVM_MSR_PERMISSIONS_MAP_SIZE                                (PAGE_SIZE * 2)
+// Legacy MSR permission-map size (2 × PAGE_SIZE).  This value is no longer
+// used by the driver — Global::MsrPermissionsMapSize is computed at boot
+// from CPUID Fn8000_000A (see Utils::InitMsrRanges) and is always preferred.
+// Kept here as an archival reference only.
+//#define SVM_MSR_PERMISSIONS_MAP_SIZE                        (PAGE_SIZE * 2)
 
 // Page 120
 // http://www.0x04.net/doc/amd/33047.pdf

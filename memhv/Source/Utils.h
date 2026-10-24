@@ -145,6 +145,34 @@ namespace Utils
     bool GetOffsets();
 
     //
+    // Dynamically resolves ObfReferenceObject, ObfDereferenceObject, and
+    // MmGetPhysicalMemoryRanges from the running kernel via
+    // MmGetSystemRoutineAddress (with export-table fallback).  Also
+    // discovers the OBJECT_HEADER PointerCount offset by pattern-scanning
+    // when the Ob* functions cannot be resolved.  Must be called at
+    // PASSIVE_LEVEL (i.e. from Entry before VMX is enabled).
+    bool InitObjectFunctions();
+
+    //
+    // Returns the total physical memory in bytes, queried from the kernel's
+    // PHYSICAL_MEMORY_RANGE list (resolved dynamically at boot).  Zero is
+    // returned on failure.
+    ULONG64 GetTotalSystemMemory();
+
+    //
+    // Parses the export directory of an already-mapped kernel module (e.g.
+    // ntoskrnl.exe or hal.dll) to locate an exported function by name.
+    // Returns nullptr if the export is not found.
+    PVOID GetKernelModuleExport(PVOID moduleBase, const char* exportName);
+
+    //
+    // Discovers the OBJECT_HEADER PointerCount offset by disassembling the
+    // ObfReferenceObjectWithTag implementation in ntoskrnl.exe.  Returns 0
+    // on failure.  This is the fallback path when
+    // MmGetSystemRoutineAddress cannot resolve the Ob* functions directly.
+    ULONG32 FindReferenceCountOffset();
+
+    //
     // Fills Global::MsrRange01Max / MsrRange2Max / MsrPermissionsMapSize
     // from CPUID Fn8000_000A on the current CPU (Zen 2, 4800H).
     void InitMsrRanges();

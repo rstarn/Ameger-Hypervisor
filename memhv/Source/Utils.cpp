@@ -1,5 +1,7 @@
 #include "Global.h"
 
+#include <ntimage.h>
+
 char* Utils::Compare(const char* haystack, const char* needle)
 {
     do
@@ -105,6 +107,253 @@ ULONG64 Utils::FindPatternImage(void* base, const char* pattern)
     }
 
     return match;
+}
+
+PVOID Utils::GetKernelModuleExport(const PVOID moduleBase, const char* exportName)
+{
+    if (!moduleBase || !exportName)
+        return nullptr;
+
+    const auto* dosHeader = static_cast<const IMAGE_DOS_HEADER*>(moduleBase);
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+        return nullptr;
+
+    const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        reinterpret_cast<ULONG64>(moduleBase) + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
+        return nullptr;
+
+    const auto& exportDir =
+        ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (exportDir.Size == 0 || exportDir.VirtualAddress == 0)
+        return nullptr;
+
+    const auto* exportTable = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
+        reinterpret_cast<ULONG64>(moduleBase) + exportDir.VirtualAddress);
+
+    if (exportTable->NumberOfNames == 0 ||
+        exportTable->AddressOfNames == 0 ||
+        exportTable->AddressOfNameOrdinals == 0 ||
+        exportTable->AddressOfFunctions == 0)
+        return nullptr;
+
+    const auto* addressOfNames = reinterpret_cast<const PULONG>(
+        reinterpret_cast<ULONG64>(moduleBase) + exportTable->AddressOfNames);
+    const auto* addressOfNameOrdinals = reinterpret_cast<const PWORD>(
+        reinterpret_cast<ULONG64>(moduleBase) + exportTable->AddressOfNameOrdinals);
+    const auto* addressOfFunctions = reinterpret_cast<const PULONG>(
+        reinterpret_cast<ULONG64>(moduleBase) + exportTable->AddressOfFunctions);
+
+    for (ULONG i = 0; i < exportTable->NumberOfNames; i++)
+    {
+        const char* name = reinterpret_cast<const char*>(
+            reinterpret_cast<ULONG64>(moduleBase) + addressOfNames[i]);
+
+        // Use exact (case-insensitive) match, not substring — "ObfReferenceObject"
+        // must not match "ObfReferenceObjectWithTag".
+        if (_stricmp(name, exportName) == 0)
+        {
+            const WORD ordinal = addressOfNameOrdinals[i];
+            if (ordinal >= exportTable->NumberOfFunctions)
+                return nullptr;
+
+            const ULONG functionRva = addressOfFunctions[ordinal];
+            if (functionRva == 0)
+                return nullptr;
+
+            return reinterpret_cast<PVOID>(
+                reinterpret_cast<ULONG64>(moduleBase) + functionRva);
+        }
+    }
+
+    return nullptr;
+}
+
+ULONG32 Utils::FindReferenceCountOffset()
+{
+    //
+    // Discover the OBJECT_HEADER PointerCount field offset by disassembling
+    // ObfReferenceObjectWithTag in the loaded ntoskrnl image.  We look for
+    // the instruction that touches the PointerCount field — typically:
+    //
+    //   48 8B 81 <disp32>   mov rax, [rcx + disp32]        (load)
+    //   48 8B 89 <disp32>   mov rax, [rcx + disp32]        (alternate)
+    //   F0 48 83 41 <d8> 1  lock add qword [rcx + disp8], 1
+    //   F0 48 83 49 <d8> 1  lock add qword [rcx + disp8], 1 (neg disp)
+    //   F0 48 FF 41 <d8>    lock inc qword [rcx + disp8]
+    //   F0 48 FF 49 <d8>    lock inc qword [rcx + disp8]   (neg disp)
+    //
+    // The displacement is signed: the PointerCount lives *before* the
+    // object body (in the OBJECT_HEADER), so we expect a negative
+    // displacement and return its absolute value.
+    //
+    UNICODE_STRING routineName;
+    RtlInitUnicodeString(&routineName, L"ObfReferenceObjectWithTag");
+    BYTE* routine = static_cast<BYTE*>(MmGetSystemRoutineAddress(&routineName));
+    if (!routine)
+    {
+        //
+        // MmGetSystemRoutineAddress could not resolve the function directly.
+        // Fall back to exporting it from the ntoskrnl image ourselves.
+        //
+        PVOID kernelBase = GetModuleBase("ntoskrnl.exe");
+        if (!kernelBase)
+            return 0;
+
+        routine = static_cast<BYTE*>(GetKernelModuleExport(kernelBase, "ObfReferenceObjectWithTag"));
+        if (!routine)
+            return 0;
+    }
+
+    //
+    // Scan the first 128 bytes of ObfReferenceObjectWithTag for an
+    // instruction that references the PointerCount field via RCX (the
+    // first parameter / object pointer).
+    //
+    constexpr ULONG scanSize = 128;
+    for (ULONG i = 0; i + 7 < scanSize; i++)
+    {
+        // mov rax, [rcx + disp32]  →  48 8B 81 <disp32>
+        if (routine[i] == 0x48 && routine[i + 1] == 0x8B && routine[i + 2] == 0x81)
+        {
+            const INT32 disp = *reinterpret_cast<INT32*>(&routine[i + 3]);
+            if (disp < 0)
+                return static_cast<ULONG32>(-disp);
+        }
+
+        // mov rax, [rcx + disp32]  →  48 8B 89 <disp32>  (alternate ModRM)
+        if (routine[i] == 0x48 && routine[i + 1] == 0x8B && routine[i + 2] == 0x89)
+        {
+            const INT32 disp = *reinterpret_cast<INT32*>(&routine[i + 3]);
+            if (disp < 0)
+                return static_cast<ULONG32>(-disp);
+        }
+
+        // lock add qword [rcx + disp8], 1  →  F0 48 83 41 <disp8> 01
+        //                                    or F0 48 83 49 <disp8> 01 (SIB with disp8, negative)
+        if (routine[i] == 0xF0 && routine[i + 1] == 0x48 && routine[i + 2] == 0x83 &&
+            (routine[i + 3] == 0x41 || routine[i + 3] == 0x49) &&
+            routine[i + 5] == 0x01)
+        {
+            const INT8 disp = static_cast<INT8>(routine[i + 4]);
+            if (disp < 0)
+                return static_cast<ULONG32>(-disp);
+        }
+
+        // lock inc qword [rcx + disp8]  →  F0 48 FF 41 <disp8>
+        //                                   or F0 48 FF 49 <disp8> (neg disp)
+        if (routine[i] == 0xF0 && routine[i + 1] == 0x48 && routine[i + 2] == 0xFF &&
+            (routine[i + 3] == 0x41 || routine[i + 3] == 0x49))
+        {
+            const INT8 disp = static_cast<INT8>(routine[i + 4]);
+            if (disp < 0)
+                return static_cast<ULONG32>(-disp);
+        }
+    }
+
+    return 0;
+}
+
+
+bool Utils::InitObjectFunctions()
+{
+    UNICODE_STRING routineName;
+
+    //
+    // Resolve ObfReferenceObject / ObfDereferenceObject via the documented
+    // MmGetSystemRoutineAddress path (all "Ob" prefix functions are on the
+    // system-routine allow-list).  This is the preferred dynamic path.
+    //
+    RtlInitUnicodeString(&routineName, L"ObfReferenceObject");
+    Global::pObfReferenceObject = MmGetSystemRoutineAddress(&routineName);
+
+    RtlInitUnicodeString(&routineName, L"ObfDereferenceObject");
+    Global::pObfDereferenceObject = MmGetSystemRoutineAddress(&routineName);
+
+    //
+    // If MmGetSystemRoutineAddress could not resolve the Ob* functions,
+    // fall back to parsing the ntoskrnl export table ourselves.
+    //
+    if (!Global::pObfReferenceObject)
+    {
+        PVOID kernelBase = GetModuleBase("ntoskrnl.exe");
+        if (kernelBase)
+            Global::pObfReferenceObject = GetKernelModuleExport(kernelBase, "ObfReferenceObject");
+    }
+
+    if (!Global::pObfDereferenceObject)
+    {
+        PVOID kernelBase = GetModuleBase("ntoskrnl.exe");
+        if (kernelBase)
+            Global::pObfDereferenceObject = GetKernelModuleExport(kernelBase, "ObfDereferenceObject");
+    }
+
+    //
+    // MmGetPhysicalMemoryRanges is resolved and cached on first use inside
+    // Utils::GetTotalSystemMemory(); no need to duplicate the lookup here.
+    // If it cannot be resolved, GetTotalSystemMemory returns 0 and
+    // BuildNestedPageTables falls back to a single 512 GB slot, which is
+    // sufficient for any consumer memory on this machine.
+
+    //
+    // If we have both Obf functions, prefer calling them directly.
+    // Otherwise, discover the PointerCount offset by disassembling the
+    // kernel and use raw interlocked operations.
+    //
+    if (Global::pObfReferenceObject && Global::pObfDereferenceObject)
+    {
+        Global::UseObFunctions = true;
+    }
+    else
+    {
+        Global::ReferenceCountOffset = FindReferenceCountOffset();
+        if (Global::ReferenceCountOffset == 0)
+            return false;
+        Global::UseObFunctions = false;
+    }
+
+    return true;
+}
+
+ULONG64 Utils::GetTotalSystemMemory()
+{
+    //
+    // Resolve MmGetPhysicalMemoryRanges once (cached as a static).
+    // On Windows 10/11 x64 this is exported from ntoskrnl.exe.
+    //
+    static PPHYSICAL_MEMORY_RANGE (*pMmGetPhysicalMemoryRanges)(VOID) = nullptr;
+    static bool tried = false;
+
+    if (!tried)
+    {
+        tried = true;
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, L"MmGetPhysicalMemoryRanges");
+        pMmGetPhysicalMemoryRanges = reinterpret_cast<decltype(pMmGetPhysicalMemoryRanges)>(
+            MmGetSystemRoutineAddress(&name));
+        if (!pMmGetPhysicalMemoryRanges)
+        {
+            PVOID kernelBase = GetModuleBase("ntoskrnl.exe");
+            if (kernelBase)
+                pMmGetPhysicalMemoryRanges = reinterpret_cast<decltype(pMmGetPhysicalMemoryRanges)>(
+                    GetKernelModuleExport(kernelBase, "MmGetPhysicalMemoryRanges"));
+        }
+    }
+
+    if (!pMmGetPhysicalMemoryRanges)
+        return 0;
+
+    const PPHYSICAL_MEMORY_RANGE ranges = pMmGetPhysicalMemoryRanges();
+    if (!ranges)
+        return 0;
+
+    ULONG64 total = 0;
+    for (ULONG i = 0; ranges[i].NumberOfBytes.QuadPart != 0; i++)
+    {
+        total += static_cast<ULONG64>(ranges[i].NumberOfBytes.QuadPart);
+    }
+
+    return total;
 }
 
 PVOID Utils::AllocateContiguousMemory(const SIZE_T size)
@@ -276,12 +525,52 @@ bool Utils::ValidUsermodeAddress(const ULONG64 address)
 
 void Utils::ReferenceObject(PVOID object)
 {
-    _InterlockedIncrement64(static_cast<volatile LONG64*>(object) - 6);
+    if (Global::UseObFunctions && Global::pObfReferenceObject)
+    {
+        using ObfReferenceObject_t = PVOID (*)(PVOID);
+        reinterpret_cast<ObfReferenceObject_t>(Global::pObfReferenceObject)(object);
+        return;
+    }
+
+    //
+    // Fallback: the OBJECT_HEADER PointerCount offset was discovered at
+    // boot by FindReferenceCountOffset() (disassembly of
+    // ObfReferenceObjectWithTag).  The offset is in bytes, not LONG64
+    // units, so we cast accordingly.
+    //
+    if (Global::ReferenceCountOffset)
+    {
+        auto* countPtr = reinterpret_cast<volatile LONG64*>(
+            reinterpret_cast<ULONG64>(object) - Global::ReferenceCountOffset);
+        _InterlockedIncrement64(countPtr);
+        return;
+    }
+
+    //
+    // Should never reach here — InitObjectFunctions() refuses to load
+    // if neither path is available.
+    //
+    KeBugCheck(INVALID_DRIVER_HANDLE);
 }
 
 void Utils::DereferenceObject(PVOID object)
 {
-    _InterlockedExchangeAdd64(static_cast<volatile LONG64*>(object) - 6, -1);
+    if (Global::UseObFunctions && Global::pObfDereferenceObject)
+    {
+        using ObfDereferenceObject_t = VOID (*)(PVOID);
+        reinterpret_cast<ObfDereferenceObject_t>(Global::pObfDereferenceObject)(object);
+        return;
+    }
+
+    if (Global::ReferenceCountOffset)
+    {
+        auto* countPtr = reinterpret_cast<volatile LONG64*>(
+            reinterpret_cast<ULONG64>(object) - Global::ReferenceCountOffset);
+        _InterlockedExchangeAdd64(countPtr, -1);
+        return;
+    }
+
+    KeBugCheck(INVALID_DRIVER_HANDLE);
 }
 
 PVOID Utils::GetPreallocatedPool(SIZE_T size)

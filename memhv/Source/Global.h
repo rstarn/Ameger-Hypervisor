@@ -47,13 +47,18 @@ namespace Global
     {
         //
         // EPROCESS layout, resolved at boot from the running kernel image.
-        // The values below are only fallback defaults (the build this repo
-        // was developed against); GetOffsets() re-resolves them dynamically
-        // and Entry() refuses to continue if that fails, so these are never
-        // actually used on this system (Win11 24H2, build 26300).
-        inline ULONG64 ActiveProcessLinks = 0x448;
-        inline ULONG64 UniqueProcessId = 0x440;
-        inline ULONG64 DirectoryTableBase = 0x28;
+        // Defaults are zeroed so that any consumer that somehow runs before
+        // GetOffsets() will fault immediately rather than silently trusting a
+        // build-specific offset. Entry() refuses to continue if GetOffsets()
+        // fails, so these are never actually relied upon on a supported system.
+        inline ULONG64 ActiveProcessLinks = 0;
+        inline ULONG64 UniqueProcessId = 0;
+        inline ULONG64 DirectoryTableBase = 0;
+
+        //
+        // Runtime-validated flag: true once GetOffsets() has successfully
+        // resolved all EPROCESS layout offsets dynamically.
+        inline bool Resolved = false;
     }
 
     //
@@ -62,5 +67,18 @@ namespace Global
     // split, so the user/kernel boundary is MmHighestUserAddress (≈
     // 0x7FFFFFFFFFFF), not the old 48-bit 0x7FFFFFFEFFFF. Both
     // Utils::ValidUsermodeAddress and SVM::IsInUserland key off this.
-    inline ULONG64 HighestUserAddress = 0x7FFFFFFFFFFF;
+    inline ULONG64 HighestUserAddress = 0;
+
+    //
+    // Dynamically resolved at boot via MmGetSystemRoutineAddress (with an
+    // export-table-parsing fallback). These replace the old hardcoded -6
+    // (48-byte) offset into the OBJECT_HEADER for the PointerCount field,
+    // which varied silently between Windows builds. When the function
+    // pointers are available they are preferred; otherwise the
+    // ReferenceCountOffset (discovered by pattern-scanning the kernel image)
+    // is used as a fallback.
+    inline PVOID pObfReferenceObject = nullptr;
+    inline PVOID pObfDereferenceObject = nullptr;
+    inline ULONG32 ReferenceCountOffset = 0;
+    inline bool UseObFunctions = false;
 }

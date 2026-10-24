@@ -34,12 +34,12 @@ void SVM::BuildNestedPageTables(const PSHARED_VIRTUAL_PROCESSOR_DATA sharedData)
     // requires. 24GB of RAM -> 25 slots instead of 512, so the PML4/PDPT
     // arrays are sized from the installed memory at boot.
     //
-    const UINT64 totalBytes = GetTotalSystemMemory();
+    const UINT64 totalBytes = Utils::GetTotalSystemMemory();
     const UINT32 pml4SlotCount = static_cast<UINT32>((totalBytes + PAGE_SIZE_1GB - 1) / PAGE_SIZE_1GB);
     const UINT32 slotCount = pml4SlotCount ? pml4SlotCount : 1;
 
     sharedData->Pml4Entries = static_cast<PML4E_64*>(Utils::AllocatePageAligned(sizeof(PML4E_64) * slotCount));
-    sharedData->PdpEntries = static_cast<PDPTE_1GB(*)[slotCount]>(Utils::AllocatePageAligned(sizeof(PDPTE_1GB) * 512 * slotCount));
+    sharedData->PdpEntries = static_cast<PDPTE_1GB(*)[512]>(Utils::AllocatePageAligned(sizeof(PDPTE_1GB) * 512 * slotCount));
 
     for (ULONG64 pml4Index = 0; pml4Index < slotCount; pml4Index++)
     {
@@ -157,7 +157,7 @@ void SVM::BuildPermissionMap(const PVOID permissionMap)
     static const UINT32 SECOND_MSRPM_OFFSET = 0x800 * CHAR_BIT;
 
     RTL_BITMAP bitmapHeader;
-    RtlInitializeBitMap(&bitmapHeader, static_cast<PULONG>(permissionMap), Global::MsrPermissionsMapSize * CHAR_BIT);
+    RtlInitializeBitMap(&bitmapHeader, static_cast<PULONG>(permissionMap), static_cast<ULONG>(Global::MsrPermissionsMapSize * CHAR_BIT));
     RtlClearAllBits(&bitmapHeader);
 
     const ULONG offsetFrom2ndBase = (IA32_MSR_EFER - SECOND_MSR_RANGE_BASE) * BITS_PER_MSR;
@@ -178,7 +178,7 @@ bool SVM::CheckAndSetInstalled()
 
     if (!installedCpus)
     {
-        const LONG activeProcessors = KeQueryActiveProcessors(); // 16 on this machine
+        const LONG_PTR activeProcessors = KeQueryActiveProcessors(); // 16 on this machine
         const SIZE_T needed = (activeProcessors > 0 ? activeProcessors : 1);
         installedCpus = static_cast<PBYTE>(ExAllocatePool(NonPagedPool, needed));
         if (installedCpus)
@@ -217,6 +217,32 @@ UINT16 SVM::GetSegmentAccessRights(const UINT16 segmentSelector, const ULONG_PTR
     return attribute.AsUInt16;
 }
 
+ULONG SVM::GetSegmentLimit(const UINT16 segmentSelector, const ULONG_PTR gdtBase)
+{
+    //
+    // GDT entries are 8 bytes each.  Mask off the RPL (requested-privilege-level)
+    // bits to get the descriptor index.
+    //
+    const PSEGMENT_DESCRIPTOR descriptor =
+        reinterpret_cast<PSEGMENT_DESCRIPTOR>(gdtBase + (segmentSelector & ~RPL_MASK));
+
+    //
+    // The 20-bit limit is split across the descriptor:
+    //   [0:15]  from LimitLow
+    //   [16:19] from LimitHigh (4 bits)
+    // When the granularity flag is set, the limit is in 4 KiB pages and the
+    // lower 12 bits are all ones.
+    //
+    const ULONG limit =
+        static_cast<ULONG>(descriptor->Fields.LimitLow) |
+        (static_cast<ULONG>(descriptor->Fields.LimitHigh) << 16);
+
+    if (descriptor->Fields.Granularity)
+        return (limit << 12) | 0xFFF;
+
+    return limit;
+}
+
 void SVM::PrepareForVirtualization(const PVIRTUAL_PROCESSOR_DATA vpData, const PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData, const PCONTEXT contextRecord)
 {
     const ULONG processorIndex = KeGetCurrentProcessorNumber();
@@ -248,10 +274,10 @@ void SVM::PrepareForVirtualization(const PVIRTUAL_PROCESSOR_DATA vpData, const P
     vpData->GuestVmcb.StateSaveArea.IdtrBase = idtr.Base;
     vpData->GuestVmcb.StateSaveArea.IdtrLimit = idtr.Limit;
 
-    vpData->GuestVmcb.StateSaveArea.CsLimit = GetSegmentLimit(contextRecord->SegCs);
-    vpData->GuestVmcb.StateSaveArea.DsLimit = GetSegmentLimit(contextRecord->SegDs);
-    vpData->GuestVmcb.StateSaveArea.EsLimit = GetSegmentLimit(contextRecord->SegEs);
-    vpData->GuestVmcb.StateSaveArea.SsLimit = GetSegmentLimit(contextRecord->SegSs);
+    vpData->GuestVmcb.StateSaveArea.CsLimit = GetSegmentLimit(contextRecord->SegCs, gdtr.Base);
+    vpData->GuestVmcb.StateSaveArea.DsLimit = GetSegmentLimit(contextRecord->SegDs, gdtr.Base);
+    vpData->GuestVmcb.StateSaveArea.EsLimit = GetSegmentLimit(contextRecord->SegEs, gdtr.Base);
+    vpData->GuestVmcb.StateSaveArea.SsLimit = GetSegmentLimit(contextRecord->SegSs, gdtr.Base);
     vpData->GuestVmcb.StateSaveArea.CsSelector = contextRecord->SegCs;
     vpData->GuestVmcb.StateSaveArea.DsSelector = contextRecord->SegDs;
     vpData->GuestVmcb.StateSaveArea.EsSelector = contextRecord->SegEs;

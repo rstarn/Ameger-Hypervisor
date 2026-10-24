@@ -6,9 +6,8 @@ static Memory::PAGE_INFO PageList[PageCount];
 ULONG64 Memory::GetDirectoryBase(const PEPROCESS process)
 {
     /*
-     * Offset resolved at boot by Utils::GetOffsets() from the running
-     * kernel image (PsGetProcessDirectoryBase pattern); falls back to the
-     * 0x28 default when the pattern scan fails.
+     * resolved at boot by Utils::GetOffsets() from the running kernel
+     * image; falls back to zero (unresolved) when the pattern scan fails.
      */
     return *reinterpret_cast<ULONG64*>(reinterpret_cast<PBYTE>(process) + Global::Offsets::DirectoryTableBase);
 }
@@ -87,7 +86,7 @@ ULONG64 Memory::ResolveProcessPhysicalAddress(const UINT32 pageIndex, const ULON
 
 /*
  * Some anti-cheats protect a process by making its kernel-side directory
- * base (EPROCESS + 0x28) diverge from the CR3 value that is actually loaded
+ * base (EPROCESS + DirectoryTableBase, resolved dynamically) diverge from the CR3 value that is actually loaded
  * while the process runs. Such a directory base walks to nothing and every
  * read fails with STATUS_NOT_FOUND (see the discussion on PR #13). The
  * caller can pass the CR3 observed on the CPU (e.g. captured via a CR3 write

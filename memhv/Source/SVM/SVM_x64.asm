@@ -1,6 +1,6 @@
 .const
 
-KTRAP_FRAME_SIZE            equ     190h
+KTRAP_FRAME_SIZE            equ     190h  ; verified: KTRAP_FRAME_LENGTH in Win11 24H2 SDK (10.0.26100.0\shared\ksamd64.inc)
 MACHINE_FRAME_SIZE          equ     28h
 
 .code

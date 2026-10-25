@@ -1,4 +1,4 @@
-#include "../../Global.h"
+#include "../../Global.h" // IWYU pragma: keep
 
 void SVM::HandleGenericSVM(const PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_CONTEXT guestContext)
 {

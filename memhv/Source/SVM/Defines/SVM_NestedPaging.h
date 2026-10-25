@@ -2,6 +2,20 @@
 
 namespace SVM
 {
+    //
+    // Transparent-hide tuning.  Hidden pages are made not-present in the NPT
+    // and are restored by SVM::RestoreHiddenPage() the first time the guest
+    // touches one (nested page fault).  Once a restored page has gone quiet for
+    // NPT_REHIDE_GRACE VMEXITs it is reverted to not-present, so actively-used
+    // pages stay mapped while the dormant bulk of a hidden image goes back to
+    // invisible.  All failure modes degrade to "the page stays mapped" (a minor
+    // stealth loss) and never to a correctness failure.
+    //
+    constexpr ULONG NPT_REHIDE_CAPACITY = 64;    // tracked pages (power of two)
+    constexpr LONG  NPT_REHIDE_GRACE = 4096;     // quiet VMEXITs before revert
+    constexpr ULONG NPT_REHIDE_SCAN_INTERVAL = 4096; // VMEXITs between revert scans
+    constexpr ULONG NPT_REHIDE_SCAN = 16;        // slots scanned per scan
+
     typedef struct _APIC_BASE
     {
         union

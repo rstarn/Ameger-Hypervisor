@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../Defines/SVM_ProcessorData.h"
+
 namespace SVM
 {
     void InjectGeneralProtectionException(PVIRTUAL_PROCESSOR_DATA vpData);

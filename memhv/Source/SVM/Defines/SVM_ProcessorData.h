@@ -1,5 +1,8 @@
 #pragma once
 
+#include "SVM_NestedPaging.h"
+#include "SVM_ControlArea.h"
+
 namespace SVM
 {
     typedef struct _SEGMENT_DESCRIPTOR
@@ -53,6 +56,45 @@ namespace SVM
         PVOID MsrPermissionsMap;
         DECLSPEC_ALIGN(PAGE_SIZE) PML4E_64* Pml4Entries;
         DECLSPEC_ALIGN(PAGE_SIZE) PDPTE_1GB(*PdpEntries)[512];
+
+        //
+        // NPT rewrite bookkeeping, shared by every vCPU.
+        //
+        // NptFlushGeneration is bumped once by ProtectSelf() after the new
+        // NPT entries are in place; NptFlushSeen holds, per system-wide
+        // processor index, the generation that vCPU has already flushed
+        // for, so a vCPU re-arms TlbControl exactly once per rewrite.
+        //
+        // Both sit in the tail padding of this page-aligned struct (the
+        // last pointer ends at 0x2008, sizeof is 0x3000), so adding them
+        // changes neither sizeof() nor any field offset above.
+        //
+        volatile LONG NptFlushGeneration;
+        LONG* NptFlushSeen;
+
+        //
+        // Transparent-hide revert bookkeeping (tail padding, zeroed at
+        // allocation).  NptExitCounter counts VMEXITs and drives the amortized
+        // revert scan; NptRehide[] holds recently restored pages plus the exit
+        // at which each was restored, so HandleExit() can put a page back to
+        // not-present once the guest stops touching it.
+        //
+        volatile LONG NptExitCounter;
+        volatile LONG NptRehideIndex;
+        PT_ENTRY_4KB* NptRehide[NPT_REHIDE_CAPACITY];
+        LONG NptRehideRestoreExit[NPT_REHIDE_CAPACITY];
+
+        //
+        // Per-CPU count of consecutive nested page faults that could not be
+        // attributed to a hidden page (split table unavailable, or the entry
+        // already present).  A healthy machine never accumulates these: every
+        // other exit and every successful restore resets the CPU's slot.  A
+        // stuck faulting instruction does accumulate them, and HandleExit()
+        // turns a long run into a diagnosable bugcheck instead of letting
+        // that CPU spin silently between VMRUN and #NPF forever.  Processors
+        // with an index >= 64 share slot 0 (diagnostic accuracy only).
+        //
+        volatile LONG NpfUnresolvedRun[64];
     } SHARED_VIRTUAL_PROCESSOR_DATA, * PSHARED_VIRTUAL_PROCESSOR_DATA;
 
     typedef struct _VIRTUAL_PROCESSOR_DATA
@@ -77,7 +119,26 @@ namespace SVM
         DECLSPEC_ALIGN(PAGE_SIZE) VMCB HostVmcb;
         DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStateArea[PAGE_SIZE];
     } VIRTUAL_PROCESSOR_DATA, * PVIRTUAL_PROCESSOR_DATA;
+    //
+    // This struct is page-aligned and exactly full: any field appended after
+    // HostStateArea pads sizeof() up to the next page and breaks the assert
+    // below.  Per-vCPU state that is not part of the CPU/asm-visible layout
+    // therefore belongs in SHARED_VIRTUAL_PROCESSOR_DATA (which has tail
+    // padding) or in a separately allocated array.
+    //
     static_assert(sizeof(VIRTUAL_PROCESSOR_DATA) == KERNEL_STACK_SIZE + PAGE_SIZE * 3, "VIRTUAL_PROCESSOR_DATA size mismatch");
+
+    //
+    // SVM_x64.asm hardcodes KTRAP_FRAME_SIZE = 190h for the frame it
+    // reserves below HostStackLayout.GuestVmcbPa, and reads
+    // HostStackLayout.Self through [rsp + 8 * 18 + KTRAP_FRAME_SIZE].
+    // Keep the C layout and the assembly constants in sync.
+    //
+    static_assert(sizeof(KTRAP_FRAME) == 0x190, "KTRAP_FRAME size must match KTRAP_FRAME_SIZE in SVM_x64.asm");
+    static_assert(FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.GuestVmcbPa) == KERNEL_STACK_SIZE - sizeof(PVOID) * 6, "HostStackLayout.GuestVmcbPa offset mismatch");
+    static_assert(FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.Self) == KERNEL_STACK_SIZE - sizeof(PVOID) * 4, "HostStackLayout.Self offset mismatch");
+    static_assert(FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.Self) - FIELD_OFFSET(VIRTUAL_PROCESSOR_DATA, HostStackLayout.GuestVmcbPa) == 0x10,
+        "SVM_x64.asm reads Self at [rsp + 8 * 18 + KTRAP_FRAME_SIZE], i.e. 0x10 bytes above GuestVmcbPa");
 
     typedef struct _GUEST_REGISTERS
     {

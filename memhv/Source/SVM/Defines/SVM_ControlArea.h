@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 namespace SVM
 {
     typedef struct _VMCB_CONTROL_AREA
@@ -44,6 +46,25 @@ namespace SVM
         UINT8 Reserved4[0x400 - 0x110];     // +0x110
     } VMCB_CONTROL_AREA, * PVMCB_CONTROL_AREA;
     static_assert(sizeof(VMCB_CONTROL_AREA) == 0x400, "VMCB_CONTROL_AREA size mismatch");
+
+    //
+    // The VMCB is consumed by the CPU and by the assembly entry point, so
+    // every field the driver touches is pinned to its APM-defined offset.
+    //
+    static_assert(offsetof(VMCB_CONTROL_AREA, IopmBasePa) == 0x040, "IopmBasePa offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, MsrpmBasePa) == 0x048, "MsrpmBasePa offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, TscOffset) == 0x050, "TscOffset offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, GuestAsid) == 0x058, "GuestAsid offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, TlbControl) == 0x05c, "TlbControl offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, VIntr) == 0x060, "VIntr offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, ExitCode) == 0x070, "ExitCode offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, ExitInfo1) == 0x078, "ExitInfo1 offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, ExitInfo2) == 0x080, "ExitInfo2 offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, ExitIntInfo) == 0x088, "ExitIntInfo offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, NpEnable) == 0x090, "NpEnable offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, EventInj) == 0x0a8, "EventInj offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, NCr3) == 0x0b0, "NCr3 offset mismatch");
+    static_assert(offsetof(VMCB_CONTROL_AREA, VmcbSaveStatePointer) == 0x108, "VmcbSaveStatePointer offset mismatch");
 
     typedef struct _VMCB_STATE_SAVE_AREA
     {
@@ -122,6 +143,19 @@ namespace SVM
     } VMCB_STATE_SAVE_AREA, * PVMCB_STATE_SAVE_AREA;
     static_assert(sizeof(VMCB_STATE_SAVE_AREA) == 0x298, "VMCB_STATE_SAVE_AREA size mismatch");
 
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Cpl) == 0x0cb, "Cpl offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Efer) == 0x0d0, "Efer offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Cr4) == 0x148, "Cr4 offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Cr3) == 0x150, "Cr3 offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Cr0) == 0x158, "Cr0 offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Dr7) == 0x160, "Dr7 offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Dr6) == 0x168, "Dr6 offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Rflags) == 0x170, "Rflags offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Rip) == 0x178, "Rip offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Rsp) == 0x1d8, "Rsp offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, Rax) == 0x1f8, "Rax offset mismatch");
+    static_assert(offsetof(VMCB_STATE_SAVE_AREA, GPat) == 0x268, "GPat offset mismatch");
+
     typedef struct _VMCB
     {
         VMCB_CONTROL_AREA ControlArea;
@@ -129,4 +163,18 @@ namespace SVM
         UINT8 Reserved1[0x1000 - sizeof(VMCB_CONTROL_AREA) - sizeof(VMCB_STATE_SAVE_AREA)];
     } VMCB, * PVMCB;
     static_assert(sizeof(VMCB) == 0x1000, "VMCB size mismatch");
+    static_assert(offsetof(VMCB, StateSaveArea) == 0x400, "VMCB state save area offset mismatch");
+
+    //
+    // Tell the CPU to reload the first 256 bytes of the VMCB control area
+    // (offsets 0x000-0x0FF, VMCB_Clean bit 0) at the next VMRUN.  That region
+    // holds TlbControl and EventInj: if a VMEXIT handler writes TlbControl=1
+    // without invalidating this clean bit, the VMRUN ignores it, the NPT TLB
+    // is never flushed, and a restored page keeps faulting forever - the CPU
+    // livelocks between VMRUN and the nested page fault.
+    //
+    inline void MarkControlAreaDirty(VMCB_CONTROL_AREA& controlArea)
+    {
+        controlArea.VmcbClean &= ~1ULL;
+    }
 }

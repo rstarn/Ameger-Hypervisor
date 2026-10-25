@@ -1,0 +1,33 @@
+# clangd configuration for the Hypervisor user-mode client.
+#
+# Mirrors the real MSBuild build (Client.vcxproj, Release|x64) so that clangd
+# parses the sources with the same preprocessor state as cl.exe.
+# Toolchain on this machine:
+#   Windows SDK 10.0.28000.0
+#   MSVC 19.51.36260 (14.51.36231), VS 18 BuildTools
+
+CompileFlags:
+  Add:
+    - "--target=x86_64-pc-windows-msvc"
+    - "-fms-extensions"
+    - "-fms-compatibility"
+    - "-fms-compatibility-version=19.51.36260"
+    - "-fdelayed-template-parsing"
+    - "-std=c++20"
+
+    - "-D_WIN64"
+    - "-D_AMD64_"
+    - "-D_WIN32_WINNT=0x0A00"
+    - "-DWINVER=0x0A00"
+    - "-DNTDDI_VERSION=0xA000012"
+
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.28000.0/ucrt"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.28000.0/shared"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.28000.0/um"
+    - "-isystemC:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/MSVC/14.51.36231/include"
+
+    - "-Wno-unknown-attributes"
+    - "-Wno-microsoft-enum-forward-reference"
+    - "-Wno-ignored-pragma-intrinsic"
+    - "-Wno-pragma-pack"
+    - "-Wno-delayed-template-parsing-in-cxx20"

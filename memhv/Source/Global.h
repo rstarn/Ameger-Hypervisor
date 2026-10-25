@@ -1,7 +1,5 @@
 #pragma once
 
-#define NESTED_MODE true
-
 #include <ntifs.h>
 #include <intrin.h>
 #include <ntdef.h>
@@ -21,15 +19,85 @@
 #include "SVM/SVM.h"
 #include "SVM/Handlers/SVM_VMExit.h"
 
+//
+// SVM_ENABLE_SELF_HIDE
+//
+// Compile-time switch for SVM::ProtectSelf(), i.e. the client's "protect the
+// hypervisor" step.  When enabled, HideRange() clears the Present bit of the
+// nested page table entries backing the driver's own image, and the #NPF
+// handler restores them transparently on guest access.
+//
+// DISABLED (0) since build 2026-10-25-e, by the operator's directive, after
+// the crash dump 102526-12046-01 (bugcheck 0x11F, arg1='NPF1'): the hide
+// itself works, but guest-mode threads that legitimately execute driver
+// image code (the log flusher thread, the process-notify callback) fault on
+// the hidden .text/.bss pages, and on real Zen 2 hardware the restore path
+// failed to resolve the fault 1000 consecutive times - the CPU kept
+// refaulting a page whose NPT entry the handler read as present - and the
+// tripwire converted the livelock into a bugcheck.  Hiding pages the guest
+// OS executes behind a nested-page-fault restore loop is inherently a
+// livelock hazard; the driver's stealth therefore relies on what the mapper
+// already provides (stripped PE header, unlinked from the loader lists,
+// PiDDB/hash-cache cleanup) instead of NPT manipulation.
+//
+// While disabled, ProtectSelf()/HideRange() are no-op successes: the mapper's
+// hide block runs, every command reports success, the NPT is never modified,
+// and no nested page fault can occur (the identity map is fully present).
+// The rest of the hypervisor - virtualization, the VMCALL interface and the
+// physical memory copy path - is unaffected.
+//
+// If this is ever re-enabled, the NPF restore path must be redesigned first:
+// (a) the diagnostic/unresolved path must not allocate split tables (it can
+// exhaust the preallocated pool and permanently break every restore), and
+// (b) the restore must be made robust against walk-cache disagreement
+// (TLB_CONTROL flushes alone demonstrably did not guarantee the CPU's next
+// walk observed the restored entry).
+//
+#define SVM_ENABLE_SELF_HIDE 0
+
 namespace Global
 {
     inline PVOID BlankPage = nullptr;
     inline PVOID PreallocatedPools[32];
 
     //
+    // Image base and allocation size of this driver, recorded by Entry() from
+    // the DRIVER_OBJECT it was entered with.  A normally loaded driver gets
+    // the loader's object; a mapped one gets the object the mapper fabricates
+    // with DriverStart = allocation base and DriverSize = allocation size.
+    // DriverSize stays zero if Entry() had to fall back to __ImageBase and
+    // the headers there are not a valid PE image.
+    //
+    inline ULONG64 DriverBase = 0;
+    inline ULONG64 DriverSize = 0;
+
+    //
+    // Readiness handshake between Entry() and the system thread that runs
+    // SVM::VirtualizeAllProcessors().  Entry() must not return before every
+    // CPU has executed VMRUN: a VMMCALL issued on a CPU that is not in guest
+    // mode raises #UD in user mode and kills the client.
+    //
+    // Entry() initializes the event before creating the thread, the thread
+    // stores its final NTSTATUS in VirtualizationStatus and then signals.
+    // Both live in the driver image, which the mapper keeps mapped and which
+    // is non-paged.
+    //
+    inline KEVENT VirtualizationReady;
+    inline NTSTATUS VirtualizationStatus = STATUS_PENDING;
+
+    //
     // Per-CPU virtualization state, sized at runtime from the active
     // processor count (this machine: 16 logical CPUs).
+    //
+    // VirtualizedCpus is an array of PVIRTUAL_PROCESSOR_DATA indexed by the
+    // system-wide processor index (KeGetProcessorIndexFromNumber), i.e. the
+    // same index space KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)
+    // counts.  VirtualizeProcessor() publishes each CPU's vpData there and
+    // ProtectSelf() walks the array to reach every VMCB.  Never freed: it
+    // has to stay valid for the whole time the driver is resident.
+    //
     inline PBYTE VirtualizedCpus = nullptr;
+    inline ULONG VirtualizedCpuCount = 0;
 
     //
     // Size of the MSR permission map in bytes, computed at runtime from

@@ -15,6 +15,8 @@ namespace Shared
         GetDirectoryBase,
         CopyProcessMemory,
         ProtectSelf,
+        FlushNpt,
+        ProtectRange,
     };
 
     enum ErrorCodes
@@ -24,6 +26,7 @@ namespace Shared
         MemoryCopyTooLarge,
         MemoryCopyFailSource,
         MemoryCopyFailTarget,
+        InvalidProcess,
     };
 
     typedef struct _COPY_MEMORY_DATA

@@ -1,4 +1,5 @@
 #include "../Global.h"
+#include "../HVLog.h"
 
 constexpr UINT32 PageCount = 64;
 static Memory::PAGE_INFO PageList[PageCount];
@@ -6,9 +7,16 @@ static Memory::PAGE_INFO PageList[PageCount];
 ULONG64 Memory::GetDirectoryBase(const PEPROCESS process)
 {
     /*
+     * The pointer is validated before it gets here: HandleGetDirectoryBase
+     * only accepts an EPROCESS that is present in the active process list,
+     * and every other caller passes a kernel-owned process object.
+     *
      * resolved at boot by Utils::GetOffsets() from the running kernel
      * image; falls back to zero (unresolved) when the pattern scan fails.
      */
+    if (!process || Global::Offsets::DirectoryTableBase == 0)
+        return 0;
+
     return *reinterpret_cast<ULONG64*>(reinterpret_cast<PBYTE>(process) + Global::Offsets::DirectoryTableBase);
 }
 
@@ -49,36 +57,81 @@ ULONG64 Memory::ResolveProcessPhysicalAddress(const UINT32 pageIndex, const ULON
     PTE_CR3 cr3;
     cr3.Value = directoryBase;
 
+    /*
+     * Every address below comes from the guest: the directory base itself
+     * and each table pointer read out of a guest-controlled entry.  An
+     * aligned CR3 can still point at an MMIO hole or an unbacked GPA, and
+     * remapping such a page machine-checks or hangs the host, so the 4 KB
+     * page containing each table address is checked against the cached RAM
+     * ranges before it is read.  A table entry never crosses its page
+     * (index * 8 stays inside the 4 KB the PFN describes), so validating
+     * the page covers the whole read.
+     */
+    const ULONG64 pml4Page = PFN_TO_PAGE(cr3.Pml4);
+    if (!Utils::IsPhysicalRangeValid(pml4Page, PAGE_SIZE))
+        return 0;
+
     PML4E pml4e;
-    ULONG64 pml4eAddress = PFN_TO_PAGE(cr3.Pml4) + virtualAddress.Pml4Index * sizeof(PML4E);
+    ULONG64 pml4eAddress = pml4Page + virtualAddress.Pml4Index * sizeof(PML4E);
     ReadPhysicalAddress(page, pml4eAddress, &pml4e, sizeof(PML4E));
     if (!pml4e.Present)
         return 0;
 
+    //
+    // Every level must be user accessible.  The copy path only accepts user
+    // addresses, so a translation that goes through a supervisor entry is not
+    // a translation of the address the caller named - and a guest-supplied
+    // directory base pointing at a page of hand-built PTEs would otherwise be
+    // able to name any physical page, including a kernel stack, as "user".
+    //
+    if (!pml4e.User)
+        return 0;
+
+    const ULONG64 pdptPage = PFN_TO_PAGE(pml4e.Pdpt);
+    if (!Utils::IsPhysicalRangeValid(pdptPage, PAGE_SIZE))
+        return 0;
+
     PDPTE pdpte;
-    ULONG64 pdpteAddress = PFN_TO_PAGE(pml4e.Pdpt) + virtualAddress.PdptIndex * sizeof(PDPTE);
+    ULONG64 pdpteAddress = pdptPage + virtualAddress.PdptIndex * sizeof(PDPTE);
     ReadPhysicalAddress(page, pdpteAddress, &pdpte, sizeof(PDPTE));
     if (!pdpte.Present)
+        return 0;
+
+    if (!pdpte.User)
         return 0;
 
     // If 1GB page
     if (pdpte.PageSize)
         return PFN_TO_PAGE(pdpte.Pd) + virtualAddress.Offset1gb;
 
+    const ULONG64 pdPage = PFN_TO_PAGE(pdpte.Pd);
+    if (!Utils::IsPhysicalRangeValid(pdPage, PAGE_SIZE))
+        return 0;
+
     PDE pde;
-    ULONG64 pdeAddress = PFN_TO_PAGE(pdpte.Pd) + virtualAddress.PdIndex * sizeof(PDE);
+    ULONG64 pdeAddress = pdPage + virtualAddress.PdIndex * sizeof(PDE);
     ReadPhysicalAddress(page, pdeAddress, &pde, sizeof(PDE));
     if (!pde.Present)
+        return 0;
+
+    if (!pde.User)
         return 0;
 
     // If 2MB page
     if (pde.PageSize)
         return PFN_TO_PAGE(pde.Pt) + virtualAddress.Offset2mb;
 
+    const ULONG64 ptPage = PFN_TO_PAGE(pde.Pt);
+    if (!Utils::IsPhysicalRangeValid(ptPage, PAGE_SIZE))
+        return 0;
+
     PTE pte;
-    ULONG64 pteAddress = PFN_TO_PAGE(pde.Pt) + virtualAddress.PtIndex * sizeof(PTE);
+    ULONG64 pteAddress = ptPage + virtualAddress.PtIndex * sizeof(PTE);
     ReadPhysicalAddress(page, pteAddress, &pte, sizeof(PTE));
     if (!pte.Present)
+        return 0;
+
+    if (!pte.User)
         return 0;
 
     return PFN_TO_PAGE(pte.PageFrame) + virtualAddress.Offset4kb;
@@ -203,22 +256,50 @@ void Memory::RestorePage(const UINT32 pageIndex)
     __invlpg(pageInfo->VirtualAddress);
 }
 
-void Memory::ReadPhysicalAddress(const UINT32 pageIndex, const ULONG64 targetAddress, const PVOID buffer, const SIZE_T size)
+bool Memory::ReadPhysicalAddress(const UINT32 pageIndex, const ULONG64 targetAddress, const PVOID buffer, const SIZE_T size)
 {
+    /*
+     * The address is either a table address derived from a guest-supplied
+     * directory base or a page resolved through guest-controlled entries.
+     * Remapping a page that is not backed by RAM (MMIO hole, PCIe window,
+     * unbacked GPA) machine-checks or hangs the host, so the complete range
+     * is validated against the cached RAM ranges first.  Failure is reported
+     * to the caller; nothing here bugchecks.
+     */
+    if (!Utils::IsPhysicalRangeValid(targetAddress, size))
+        return false;
+
     const PVOID virtualAddress = OverwritePage(pageIndex, targetAddress);
     memcpy(buffer, virtualAddress, size);
     RestorePage(pageIndex);
+
+    return true;
 }
 
-void Memory::WritePhysicalAddress(const UINT32 pageIndex, const ULONG64 targetAddress, const PVOID buffer, const SIZE_T size)
+bool Memory::WritePhysicalAddress(const UINT32 pageIndex, const ULONG64 targetAddress, const PVOID buffer, const SIZE_T size)
 {
+    // See ReadPhysicalAddress: a non-RAM target must never be mapped, and on
+    // the copy path this is the guest-declared destination.
+    if (!Utils::IsPhysicalRangeValid(targetAddress, size))
+        return false;
+
     const PVOID virtualAddress = OverwritePage(pageIndex, targetAddress);
     memcpy(virtualAddress, buffer, size);
     RestorePage(pageIndex);
+
+    return true;
 }
 
 NTSTATUS Memory::ReadProcessMemoryEx(const UINT32 pageIndex, const ULONG64 directoryBase, const ULONG64 directoryTableBase, const ULONG64 address, PVOID buffer, const SIZE_T size, SIZE_T* bytesRead)
 {
+    /*
+     * pageIndex is HostStackLayout.ProcessorIndex, i.e. the system-wide
+     * processor number, and it selects a slot in the fixed PageList.
+     * Bound it before it is used as an array index.
+     */
+    if (pageIndex >= PageCount)
+        return STATUS_INVALID_PARAMETER;
+
     SIZE_T currentOffset = 0;
     SIZE_T totalSize = size;
     while (totalSize)
@@ -229,7 +310,8 @@ NTSTATUS Memory::ReadProcessMemoryEx(const UINT32 pageIndex, const ULONG64 direc
 
         const ULONG64 readSize = min(PAGE_SIZE - (currentPhysicalAddress & 0xFFF), totalSize);
 
-        ReadPhysicalAddress(pageIndex, currentPhysicalAddress, reinterpret_cast<PVOID>(reinterpret_cast<ULONG64>(buffer) + currentOffset), readSize);
+        if (!ReadPhysicalAddress(pageIndex, currentPhysicalAddress, reinterpret_cast<PVOID>(reinterpret_cast<ULONG64>(buffer) + currentOffset), readSize))
+            return STATUS_INVALID_ADDRESS;
 
         totalSize -= readSize;
         currentOffset += readSize;
@@ -242,6 +324,9 @@ NTSTATUS Memory::ReadProcessMemoryEx(const UINT32 pageIndex, const ULONG64 direc
 
 NTSTATUS Memory::WriteProcessMemoryEx(const UINT32 pageIndex, const ULONG64 directoryBase, const ULONG64 directoryTableBase, const ULONG64 address, PVOID buffer, const SIZE_T size, SIZE_T* bytesWritten)
 {
+    if (pageIndex >= PageCount)
+        return STATUS_INVALID_PARAMETER;
+
     SIZE_T currentOffset = 0;
     SIZE_T totalSize = size;
     while (totalSize)
@@ -252,7 +337,20 @@ NTSTATUS Memory::WriteProcessMemoryEx(const UINT32 pageIndex, const ULONG64 dire
 
         const ULONG64 writeSize = min(PAGE_SIZE - (currentPhysicalAddress & 0xFFF), totalSize);
 
-        WritePhysicalAddress(pageIndex, currentPhysicalAddress, reinterpret_cast<PVOID>(reinterpret_cast<ULONG64>(buffer) + currentOffset), writeSize);
+        //
+        // Re-walk the same virtual address immediately before the store.  The
+        // guest owns the page tables the first walk read: it can remap the
+        // address between that resolve and the memcpy below, which would turn
+        // a validated user page into an arbitrary physical write (a classic
+        // TOCTOU on a double-walk).  Only an identical PFN is accepted; a
+        // changed - or now supervisor, or unmapped - entry aborts the copy.
+        //
+        const ULONG64 revalidatedPhysicalAddress = ResolveProcessPhysicalAddressEx(pageIndex, directoryBase, directoryTableBase, address + currentOffset);
+        if ((revalidatedPhysicalAddress >> PAGE_SHIFT) != (currentPhysicalAddress >> PAGE_SHIFT))
+            return STATUS_NOT_FOUND;
+
+        if (!WritePhysicalAddress(pageIndex, currentPhysicalAddress, reinterpret_cast<PVOID>(reinterpret_cast<ULONG64>(buffer) + currentOffset), writeSize))
+            return STATUS_INVALID_ADDRESS;
 
         totalSize -= writeSize;
         currentOffset += writeSize;
@@ -265,10 +363,56 @@ NTSTATUS Memory::WriteProcessMemoryEx(const UINT32 pageIndex, const ULONG64 dire
 
 NTSTATUS Memory::CopyProcessMemoryEx(const UINT32 pageIndex, const ULONG64 sourceDirectoryBase, const ULONG64 sourceAddress, const ULONG64 targetDirectoryBase, const ULONG64 targetAddress, const ULONG64 currentDirectoryBase, const ULONG64 currentDirectoryTableBase, const SIZE_T bufferSize)
 {
+    //
+    // The copy stages the whole request in one scratch page sized
+    // Shared::MAX_RW_SIZE, so anything larger would overflow it.  The handler
+    // caps the request as well, but the bound belongs here too: this function
+    // is the one that owns the buffer.
+    //
+    if (bufferSize == 0 || bufferSize > Shared::MAX_RW_SIZE)
+        return STATUS_INVALID_PARAMETER;
+
+    if (pageIndex >= PageCount)
+        return STATUS_INVALID_PARAMETER;
+
     if (!Utils::ValidUsermodeAddress(sourceAddress))
         return STATUS_INVALID_ADDRESS;
 
     if (!Utils::ValidUsermodeAddress(targetAddress))
+        return STATUS_INVALID_ADDRESS;
+
+    /*
+     * Both directory bases come straight from the guest control block.  A
+     * zero, misaligned or out-of-range CR3 makes the page walk read page
+     * table entries from arbitrary physical memory, and on the target side
+     * WritePhysicalAddress would then memcpy up to 64 KB into it.  A valid
+     * directory base is 4 KB aligned and fits the 52-bit physical address
+     * space, so anything else is rejected before the walk.
+     *
+     * Alignment alone is not enough: any aligned RAM page filled with
+     * hand-built PTEs walks to arbitrary physical memory.  A directory base
+     * that does not belong to a live process is refused, so only address
+     * spaces the kernel itself built can be named.
+     */
+    if (sourceDirectoryBase == 0 || (sourceDirectoryBase & 0xFFF) != 0 ||
+        sourceDirectoryBase > 0x000FFFFFFFFFF000ULL ||
+        !Utils::IsValidDirectoryBase(sourceDirectoryBase))
+        return STATUS_INVALID_ADDRESS;
+
+    if (targetDirectoryBase == 0 || (targetDirectoryBase & 0xFFF) != 0 ||
+        targetDirectoryBase > 0x000FFFFFFFFFF000ULL ||
+        !Utils::IsValidDirectoryBase(targetDirectoryBase))
+        return STATUS_INVALID_ADDRESS;
+
+    /*
+     * Validating only the base address lets a large size cross
+     * MmHighestUserAddress (or wrap around); the complete range has to stay
+     * inside user space on both sides.
+     */
+    if (bufferSize > Global::HighestUserAddress - sourceAddress)
+        return STATUS_INVALID_ADDRESS;
+
+    if (bufferSize > Global::HighestUserAddress - targetAddress)
         return STATUS_INVALID_ADDRESS;
 
     /*
@@ -277,20 +421,96 @@ NTSTATUS Memory::CopyProcessMemoryEx(const UINT32 pageIndex, const ULONG64 sourc
      * issued the VMMCALL. It is only meaningful for the side of the copy
      * whose directory base the client declared as its own
      * (currentDirectoryBase); the other side belongs to a remote process
-     * and is resolved from its kernel-side directory base alone. Every
-     * page is resolved immediately before it is accessed, so a fallback
-     * switch between the two bases stays safe even for a copy spanning
-     * many pages.
+     * and is resolved from its kernel-side directory base alone.
      */
     const ULONG64 sourceDirectoryTableBase = sourceDirectoryBase == currentDirectoryBase ? currentDirectoryTableBase : 0;
     const ULONG64 targetDirectoryTableBase = targetDirectoryBase == currentDirectoryBase ? currentDirectoryTableBase : 0;
 
     const PAGE_INFO* pageInfo = &PageList[pageIndex];
 
-    SIZE_T bytes = 0;
-    NTSTATUS status = ReadProcessMemoryEx(pageIndex, sourceDirectoryBase, sourceDirectoryTableBase, sourceAddress, pageInfo->CopyBuffer, bufferSize, &bytes);
-    if (!NT_SUCCESS(status))
-        return STATUS_ABANDONED;
+    /*
+     * Per-page copy.  The walk only resolves RESIDENT pages (present PTEs at
+     * every level): a page that is paged out or committed-but-never-touched
+     * (demand zero) has no translation.  Failing the whole request over one
+     * such page would make large-region transfers unreliable, so a
+     * non-resident chunk is skipped instead - reads of a demand-zero page
+     * would be zeros anyway, and skipping the destination bytes leaves them
+     * untouched rather than writing zeros over them.  The control-block read
+     * in HandleCopyProcessMemory stays strict: the caller's own stack is
+     * always resident.
+     */
+    SIZE_T offset = 0;
+    SIZE_T skippedChunks = 0;
 
-    return WriteProcessMemoryEx(pageIndex, targetDirectoryBase, targetDirectoryTableBase, targetAddress, pageInfo->CopyBuffer, bufferSize, &bytes);
+    while (offset < bufferSize)
+    {
+        const ULONG64 remaining = bufferSize - offset;
+        const ULONG64 sourceChunkAddress = sourceAddress + offset;
+        const ULONG64 targetChunkAddress = targetAddress + offset;
+
+        //
+        // Source: resolve, then read up to the source page boundary.
+        //
+        const ULONG64 sourcePhysical = ResolveProcessPhysicalAddressEx(pageIndex, sourceDirectoryBase, sourceDirectoryTableBase, sourceChunkAddress);
+        if (!sourcePhysical)
+        {
+            offset += min(PAGE_SIZE - (sourceChunkAddress & 0xFFF), remaining);
+            skippedChunks++;
+            continue;
+        }
+
+        const ULONG64 sourceRemainder = min(PAGE_SIZE - (sourcePhysical & 0xFFF), remaining);
+
+        //
+        // Destination: resolve, then clamp the chunk to the destination page
+        // boundary so the write below can never run past the page the
+        // scratch mapping covers.
+        //
+        const ULONG64 targetPhysical = ResolveProcessPhysicalAddressEx(pageIndex, targetDirectoryBase, targetDirectoryTableBase, targetChunkAddress);
+        if (!targetPhysical)
+        {
+            offset += min(sourceRemainder, remaining);
+            skippedChunks++;
+            continue;
+        }
+
+        const ULONG64 chunkSize = min(sourceRemainder, PAGE_SIZE - (targetPhysical & 0xFFF));
+
+        if (!ReadPhysicalAddress(pageIndex, sourcePhysical, reinterpret_cast<PBYTE>(pageInfo->CopyBuffer) + offset, chunkSize))
+        {
+            offset += chunkSize;
+            skippedChunks++;
+            continue;
+        }
+
+        //
+        // Re-walk the same destination address immediately before the store.
+        // The guest owns the page tables the first walk read: it can remap
+        // the address between that resolve and the memcpy below, which would
+        // turn a validated user page into an arbitrary physical write (a
+        // classic TOCTOU on a double-walk).  Only an identical PFN is
+        // accepted; a changed - or now unmapped - entry skips the chunk.
+        //
+        const ULONG64 revalidatedPhysical = ResolveProcessPhysicalAddressEx(pageIndex, targetDirectoryBase, targetDirectoryTableBase, targetChunkAddress);
+        if ((revalidatedPhysical >> PAGE_SHIFT) != (targetPhysical >> PAGE_SHIFT))
+        {
+            offset += chunkSize;
+            skippedChunks++;
+            continue;
+        }
+
+        if (!WritePhysicalAddress(pageIndex, targetPhysical, reinterpret_cast<PBYTE>(pageInfo->CopyBuffer) + offset, chunkSize))
+        {
+            offset += chunkSize;
+            skippedChunks++;
+            continue;
+        }
+
+        offset += chunkSize;
+    }
+
+    if (skippedChunks)
+        HV::LogNum("CopyProcessMemoryEx: skipped non-resident chunks", skippedChunks);
+
+    return STATUS_SUCCESS;
 }

@@ -57,9 +57,9 @@ namespace Memory
         {
             ULONG64 Offset2mb : 21;
             ULONG64 PdIndex2 : 9;
-            ULONG64 PdptIndex : 9;
-            ULONG64 Pml4Index : 9;
-            ULONG64 Reserved : 16;
+            ULONG64 PdptIndex2 : 9;
+            ULONG64 Pml4Index2 : 9;
+            ULONG64 Reserved2 : 16;
         };
 
         /*
@@ -71,9 +71,9 @@ namespace Memory
         struct
         {
             ULONG64 Offset1gb : 30;
-            ULONG64 PdptIndex : 9;
-            ULONG64 Pml4Index : 9;
-            ULONG64 Reserved : 16;
+            ULONG64 PdptIndex1 : 9;
+            ULONG64 Pml4Index1 : 9;
+            ULONG64 Reserved1 : 16;
         };
     } VIRTUAL_ADDRESS;
 
@@ -330,8 +330,8 @@ namespace Memory
     bool PreparePages();
     PVOID OverwritePage(UINT32 pageIndex, ULONG64 physicalAddress);
     void RestorePage(UINT32 pageIndex);
-    void ReadPhysicalAddress(UINT32 pageIndex, ULONG64 targetAddress, PVOID buffer, SIZE_T size);
-    void WritePhysicalAddress(UINT32 pageIndex, ULONG64 targetAddress, PVOID buffer, SIZE_T size);
+    bool ReadPhysicalAddress(UINT32 pageIndex, ULONG64 targetAddress, PVOID buffer, SIZE_T size);
+    bool WritePhysicalAddress(UINT32 pageIndex, ULONG64 targetAddress, PVOID buffer, SIZE_T size);
     NTSTATUS ReadProcessMemoryEx(UINT32 pageIndex, ULONG64 directoryBase, ULONG64 directoryTableBase, ULONG64 address, PVOID buffer, SIZE_T size, SIZE_T* bytesRead);
     NTSTATUS WriteProcessMemoryEx(UINT32 pageIndex, ULONG64 directoryBase, ULONG64 directoryTableBase, ULONG64 address, PVOID buffer, SIZE_T size, SIZE_T* bytesWritten);
     NTSTATUS CopyProcessMemoryEx(UINT32 pageIndex, ULONG64 sourceDirectoryBase, ULONG64 sourceAddress, ULONG64 targetDirectoryBase, ULONG64 targetAddress, ULONG64 currentDirectoryBase, ULONG64 currentDirectoryTableBase, SIZE_T bufferSize);

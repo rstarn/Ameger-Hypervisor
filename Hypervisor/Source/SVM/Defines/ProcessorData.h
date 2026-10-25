@@ -65,9 +65,10 @@ namespace SVM
         // processor index, the generation that vCPU has already flushed
         // for, so a vCPU re-arms TlbControl exactly once per rewrite.
         //
-        // Both sit in the tail padding of this page-aligned struct (the
-        // last pointer ends at 0x2008, sizeof is 0x3000), so adding them
-        // changes neither sizeof() nor any field offset above.
+        // All the bookkeeping below sits in the tail of this page-aligned
+        // struct (the last member ends at 0x2D38, sizeof is 0x3000), so
+        // adding fields changes neither sizeof() nor any field offset above.
+        // The allocation uses sizeof, so growth inside the tail is free.
         //
         volatile LONG NptFlushGeneration;
         LONG* NptFlushSeen;
@@ -95,6 +96,39 @@ namespace SVM
         // with an index >= 64 share slot 0 (diagnostic accuracy only).
         //
         volatile LONG NpfUnresolvedRun[64];
+
+        //
+        // Per-CPU count of nested page faults that hit an entry which is
+        // already present.  That used to be a silent fixed point (the handler
+        // only ever acted on a not-present entry, so the CPU refaulted
+        // forever).  The #NPF path now flushes unconditionally and only uses
+        // this as a stuck-CPU detector: after NPF_STALE_STRIKE_LIMIT
+        // consecutive present-entry faults the CPU disables self-hide and
+        // restores every hidden page (fail open).  Processors with an index
+        // >= 64 share slot 0 (diagnostic accuracy only).
+        //
+        volatile LONG NpfStaleStrikes[64];
+
+        //
+        // Global (system-wide) self-hide state.
+        //
+        // NptRehideEnabled is set once by ProtectSelf() and cleared - for
+        // good - by DisableSelfHide() and by TrackForRehide() once
+        // NPT_RESTORE_LIMIT pages have been restored.  HandleExit() gates its
+        // re-hide scan on it; a cleared flag means the NPT stays fully
+        // present.  NptRestoreCount counts restores for that limit.
+        //
+        // HiddenPtes[] records every leaf entry HideRange() made
+        // not-present, so DisableSelfHide() can put them all back with no
+        // allocation and no page-table walk: clearing Present left the real
+        // PFN in place, so a restore is one atomic OR of bit 0.  The pointer
+        // is stored first and HiddenPteCount is incremented after it, so a
+        // reader that sees the count also sees the slot.
+        //
+        volatile LONG NptRehideEnabled;
+        volatile LONG NptRestoreCount;
+        volatile LONG HiddenPteCount;
+        PT_ENTRY_4KB* HiddenPtes[256];
 
         //
         // 2 MB NPT fallback tables.  Null unless Global::Np1GBAvailable is

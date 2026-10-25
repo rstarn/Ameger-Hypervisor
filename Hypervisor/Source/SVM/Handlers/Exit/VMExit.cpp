@@ -152,11 +152,22 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
     // reverts while actively executed.
     //
     const LONG exitCount = sharedData ? InterlockedIncrement(&sharedData->NptExitCounter) : 0;
-    if (sharedData && exitCount > 0 && (exitCount % NPT_REHIDE_SCAN_INTERVAL) == 0)
+    if (sharedData && sharedData->NptRehideEnabled &&
+        exitCount > 0 && (exitCount % NPT_REHIDE_SCAN_INTERVAL) == 0)
     {
+        bool reHidden = false;
+
         const LONG window = (exitCount / NPT_REHIDE_SCAN_INTERVAL) & (NPT_REHIDE_CAPACITY - 1);
         for (ULONG scan = 0; scan < NPT_REHIDE_SCAN; scan++)
         {
+            //
+            // Re-check the global flag per slot: DisableSelfHide() may have
+            // run on another CPU between the gate above and this store, and
+            // it has already restored everything.
+            //
+            if (!sharedData->NptRehideEnabled)
+                break;
+
             const LONG slot = (window + scan) & (NPT_REHIDE_CAPACITY - 1);
             PT_ENTRY_4KB* const hiddenEntry = sharedData->NptRehide[slot];
             if (!hiddenEntry)
@@ -168,7 +179,17 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
             InterlockedExchange64(reinterpret_cast<volatile LONGLONG*>(&hiddenEntry->AsUInt64),
                 hiddenEntry->AsUInt64 & ~1ULL);
             sharedData->NptRehide[slot] = nullptr;
+            reHidden = true;
         }
+
+        //
+        // This CPU's next VMRUN is flushed by the TlbControl store at the top
+        // of the *next* exit, but the other vCPUs may still translate the
+        // page through a cached entry.  Bumping the generation makes each of
+        // them arm its own TlbControl at its next exit.
+        //
+        if (reHidden)
+            InterlockedIncrement(&sharedData->NptFlushGeneration);
     }
 
     switch (vpData->GuestVmcb.ControlArea.ExitCode)
@@ -203,8 +224,13 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
         // as-is, so the CPU re-executes the access against the restored page
         // and the guest never observes a fault.
         //
+        // The lookup runs with allowSplit == false: the diagnostic path must
+        // never allocate a split table.  Doing so used to burn the fixed
+        // preallocated pool on unrelated faults until genuine hidden pages
+        // could no longer be reached at all.
+        //
         // A fault outside the mapped range - an MMIO BAR above the 2 MB
-        // fallback's ceiling - cannot be restored here; it falls through to
+        // fallback's ceiling - has no entry to restore; it falls through to
         // the unresolvable path below.
         //
         // NOTHING is ever injected from this path.  Injecting #PF from a
@@ -213,56 +239,85 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
         // keeps whatever stale value it already held, so the guest's
         // page-fault handler resolves nothing, returns, and the same
         // instruction faults again - a livelock with no bugcheck, spinning
-        // that core between VMRUN and #NPF forever.  A fault that cannot be
-        // attributed to a hidden page is simply resumed (walk races are
-        // transient and self-resolving); a genuinely stuck RIP accumulates
-        // in NpfUnresolvedRun and the tripwire below turns it into a
-        // diagnosable bugcheck instead of a silent freeze.
+        // that core between VMRUN and #NPF forever.
         //
         {
             const ULONG64 gpa = vpData->GuestVmcb.ControlArea.ExitInfo2;
+            const ULONG slot = processorIndex < 64 ? processorIndex : 0;
 
             Hypervisor::LogNum("HandleExit: NPF gpa", gpa);
 
-            PT_ENTRY_4KB* entry = sharedData ? SVM::GetPageTableEntry(sharedData, gpa) : nullptr;
+            PT_ENTRY_4KB* entry = sharedData ? SVM::GetPageTableEntry(sharedData, gpa, false) : nullptr;
 
-            if (entry && entry->Present == 0)
+            if (entry)
             {
-                //
-                // HideRange() cleared only the Present bit, leaving the real
-                // PFN and Write flag intact, so restoring is one atomic
-                // Present set.
-                //
-                InterlockedExchange64(reinterpret_cast<volatile LONGLONG*>(&entry->AsUInt64), entry->AsUInt64 | 1);
-                SVM::TrackForRehide(sharedData, entry);
+                if ((entry->AsUInt64 & 1) == 0)
+                {
+                    //
+                    // HideRange() cleared only the Present bit, leaving the
+                    // real PFN and Write flag intact, so restoring is one
+                    // atomic Present set.  TrackForRehide() schedules the
+                    // page for the amortized revert scan and counts the
+                    // restore against the sticky-restore budget.
+                    //
+                    InterlockedExchange64(reinterpret_cast<volatile LONGLONG*>(&entry->AsUInt64), entry->AsUInt64 | 1);
+                    SVM::TrackForRehide(sharedData, entry);
+
+                    InterlockedExchange(&sharedData->NpfUnresolvedRun[slot], 0);
+                    InterlockedExchange(&sharedData->NpfStaleStrikes[slot], 0);
+
+                    Hypervisor::Log("NPF restored");
+                }
+                else
+                {
+                    //
+                    // The entry is already present.  That used to be a silent
+                    // fixed point: the handler did nothing, the CPU refaulted
+                    // on the same instruction, and after 1000 unresolved
+                    // faults the tripwire bugchecked.  A few of these are
+                    // normal walk-cache races, so flush unconditionally and
+                    // count them; a long run means the CPU cannot make
+                    // progress, and self-hide fails open instead of
+                    // bugchecking.
+                    //
+                    const LONG strikes = InterlockedIncrement(&sharedData->NpfStaleStrikes[slot]);
+
+                    Hypervisor::LogNum("NPF already present, gpa", gpa);
+
+                    if (strikes > NPF_STALE_STRIKE_LIMIT)
+                    {
+                        SVM::DisableSelfHide(sharedData);
+                        InterlockedExchange(&sharedData->NpfStaleStrikes[slot], 0);
+                    }
+                }
 
                 //
-                // Force a clean NPT TLB on this CPU so a stale cached entry
-                // cannot re-fault the same page in a storm.
+                // TLB_CONTROL = 1 is a full flush of the TLB *and* the nested
+                // page translations (AMD APM vol. 2, "TLB Control"): it is the
+                // only value that invalidates NPT-derived entries, and it is
+                // required even when the entry was already present, because
+                // the CPU's walk cache may still hold the stale encoding.
                 //
+                vpData->GuestVmcb.ControlArea.EventInj = 0;
                 InterlockedExchange(reinterpret_cast<volatile LONG*>(&vpData->GuestVmcb.ControlArea.TlbControl), 1);
                 SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
-
-                vpData->GuestVmcb.ControlArea.EventInj = 0;
-                SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
-
-                InterlockedExchange(&sharedData->NpfUnresolvedRun[processorIndex < 64 ? processorIndex : 0], 0);
-
-                Hypervisor::Log("HandleExit: NPF restored");
 
                 return;
             }
 
             //
-            // Not attributable to a hidden page: either the entry is already
-            // present (a transient walk race - this NPT cannot produce
-            // permission faults by construction) or the split table could
-            // not be reached.  Resume without injection and count the run.
-            // A long run means the RIP is genuinely stuck: fail loudly with
-            // a crash dump rather than freezing the machine invisibly.
+            // No entry for this GPA: either the address is outside the mapped
+            // range (MMIO) or the pool could not supply a split table.  Both
+            // mean the hide is no longer defensible - restore everything and
+            // stop re-hiding, then resume without injection.  A genuinely
+            // stuck RIP still accumulates in NpfUnresolvedRun and the
+            // tripwire below turns it into a diagnosable bugcheck instead of
+            // a silent freeze.
             //
+            SVM::DisableSelfHide(sharedData);
+
             if (sharedData &&
-                InterlockedIncrement(&sharedData->NpfUnresolvedRun[processorIndex < 64 ? processorIndex : 0]) > 1000)
+                InterlockedIncrement(&sharedData->NpfUnresolvedRun[slot]) > 1000)
             {
                 Hypervisor::Log("HandleExit: NPF stuck, bugcheck");
 
@@ -274,6 +329,9 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
             }
 
             Hypervisor::Log("HandleExit: NPF unresolvable, resuming");
+
+            vpData->GuestVmcb.ControlArea.TlbControl = 1;
+            SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
         }
         break;
     case VMEXIT_SHUTDOWN:

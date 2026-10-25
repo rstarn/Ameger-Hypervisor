@@ -226,5 +226,13 @@ namespace Utils
     void DereferenceObject(PVOID object);
 
     const SIZE_T PreallocatedPoolSize = 0x1000;
-    PVOID GetPreallocatedPool(SIZE_T poolIndex);
+    PVOID GetPreallocatedPool(SIZE_T size);
+
+    //
+    // Number of preallocated pool pages not yet handed out.  The pools are
+    // consumed in order and never returned, so this is the array size minus
+    // the number of successful GetPreallocatedPool() calls.  Zero means the
+    // next split request will fail and GetOrSplitPageTable() must fail open.
+    //
+    ULONG GetPreallocatedPoolRemaining();
 }

@@ -24,41 +24,54 @@
 //
 // Compile-time switch for SVM::ProtectSelf(), i.e. the client's "protect the
 // hypervisor" step.  When enabled, HideRange() clears the Present bit of the
-// nested page table entries backing the driver's own image, and the #NPF
-// handler restores them transparently on guest access.
+// nested page table entries backing the driver's own image minus its
+// executable sections, and the #NPF handler restores them transparently on
+// guest access.
 //
-// DISABLED (0) since build 2026-10-25-e, by the operator's directive, after
-// the crash dump 102526-12046-01 (bugcheck 0x11F, arg1='NPF1'): the hide
-// itself works, but guest-mode threads that legitimately execute driver
-// image code (the log flusher thread, the process-notify callback) fault on
-// the hidden .text/.bss pages, and on real Zen 2 hardware the restore path
-// failed to resolve the fault 1000 consecutive times - the CPU kept
-// refaulting a page whose NPT entry the handler read as present - and the
-// tripwire converted the livelock into a bugcheck.  Hiding pages the guest
-// OS executes behind a nested-page-fault restore loop is inherently a
-// livelock hazard; the driver's stealth therefore relies on what the mapper
-// already provides (stripped PE header, unlinked from the loader lists,
-// PiDDB/hash-cache cleanup) instead of NPT manipulation.
+// The previous 0x11F 'NPF1' crash (dump 102526-12046-01) was caused by three
+// independent defects in the restore path, not by the idea of hiding:
 //
-// While disabled, ProtectSelf()/HideRange() are no-op successes: the mapper's
-// hide block runs, every command reports success, the NPT is never modified,
-// and no nested page fault can occur (the identity map is fully present).
-// The rest of the hypervisor - virtualization, the VMCALL interface and the
-// physical memory copy path - is unaffected.
+//   (a) Present-entry fixed point.  The #NPF path acted only when the leaf
+//       entry was not-present.  Once it was present - a cross-vCPU restore
+//       race, or a stale walk cache after a large-page split - every further
+//       fault on that page took the "unresolved" branch, which only
+//       incremented NpfUnresolvedRun and never flushed.  That is a fixed
+//       point: the CPU refaults forever and the 1000-strike tripwire turns
+//       the livelock into a bugcheck.
+//   (b) Diagnostic-path pool burn.  GetOrSplitPageTable() split large pages
+//       for every fault, including the diagnostic/unresolved ones, consuming
+//       the fixed preallocated pool.  After ~32 unrelated NPFs the pool was
+//       empty and genuine hidden pages could no longer be restored.
+//   (c) Aligned-base first-page bug.  HideRange() computed
+//       firstPage = (base + PAGE_SIZE - 1) & pageMask, so a page-aligned
+//       image base skipped the first page of the image.
 //
-// If this is ever re-enabled, the NPF restore path must be redesigned first:
-// (a) the diagnostic/unresolved path must not allocate split tables (it can
-// exhaust the preallocated pool and permanently break every restore), and
-// (b) the restore must be made robust against walk-cache disagreement
-// (TLB_CONTROL flushes alone demonstrably did not guarantee the CPU's next
-// walk observed the restored entry).
+// The redesign therefore changes the policy in three ways:
 //
-#define HYPERVISOR_ENABLE_SELF_HIDE 0
+//   - Data-only hiding.  Hiding executable .text guarantees a permanent NPF
+//     supply, because the driver's own notify callback and log thread execute
+//     it in guest mode.  ProtectSelf() takes the executable range from the
+//     caller and HideRange() skips every page in it; only the data sections
+//     are hidden.
+//   - Unconditional flush.  Every #NPF that touches an NPT entry arms
+//     TlbControl = 1 (a full TLB + NPT flush), including the already-present
+//     case, and DisableSelfHide() publishes a new flush generation so the
+//     other vCPUs arm the same flush at their next exit.  The diagnostic path
+//     never splits large pages (allowSplit == false), so it cannot burn the
+//     pool.
+//   - Sticky restore / fail-open disable.  Restoring a page is allowed at
+//     most NPT_RESTORE_LIMIT times globally; after that the re-hide flag is
+//     cleared for good.  Any #NPF the handler cannot attribute to a hidden
+//     page calls DisableSelfHide(), which restores every recorded page from
+//     memory (no allocation) and leaves the NPT fully present.  Stealth can
+//     degrade; the machine must not bugcheck.
+//
+#define HYPERVISOR_ENABLE_SELF_HIDE 1
 
 namespace Global
 {
     inline PVOID BlankPage = nullptr;
-    inline PVOID PreallocatedPools[32];
+    inline PVOID PreallocatedPools[64];
 
     //
     // Image base and allocation size of this driver, recorded by Entry() from

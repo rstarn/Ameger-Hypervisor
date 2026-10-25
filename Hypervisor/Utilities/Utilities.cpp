@@ -15,6 +15,13 @@ namespace
         ULONG64 DirectoryBase;
     };
 
+    //
+    // Cursor over Global::PreallocatedPools.  Pools are handed out in order
+    // and never freed, so the count still available is the array size minus
+    // this cursor; GetPreallocatedPoolRemaining() reports exactly that.
+    //
+    volatile LONG PreallocatedPoolCursor = 0;
+
     KSPIN_LOCK DirectoryBaseCacheLock;
     DIRECTORY_BASE_CACHE_ENTRY DirectoryBaseCache[DirectoryBaseCacheSize] = {};
     ULONG DirectoryBaseCacheNextWay[DirectoryBaseCacheSetCount] = {};
@@ -1017,10 +1024,27 @@ void Utils::DereferenceObject(PVOID object)
     KeBugCheck(INVALID_DRIVER_HANDLE);
 }
 
+ULONG Utils::GetPreallocatedPoolRemaining()
+{
+    const LONG used = PreallocatedPoolCursor;
+    const LONG total = static_cast<LONG>(ARRAYSIZE(Global::PreallocatedPools));
+
+    if (used >= total)
+        return 0;
+
+    return static_cast<ULONG>(total - used);
+}
+
 PVOID Utils::GetPreallocatedPool(SIZE_T size)
 {
+    //
+    // A caller asking for more than a pool page is a bug, but bugchecking the
+    // guest over it turns a stealth command into a crash.  Fail the request
+    // instead: GetOrSplitPageTable() treats nullptr as "cannot split" and the
+    // #NPF path fails open.
+    //
     if (size > PreallocatedPoolSize)
-        KeBugCheck(BAD_EXHANDLE);
+        return nullptr;
 
     //
     // The index must be interlocked: GetOrSplitPageTable() runs from both the
@@ -1031,12 +1055,20 @@ PVOID Utils::GetPreallocatedPool(SIZE_T size)
     // exchanges of fully-built, equivalent tables, so racing publishers only
     // ever waste one pool - never corrupt the tree.
     //
-    static volatile LONG currentPoolIndex = 0;
-    const LONG index = InterlockedIncrement(&currentPoolIndex) - 1;
+    const LONG index = InterlockedIncrement(&PreallocatedPoolCursor) - 1;
     if (index < 0 || index >= static_cast<LONG>(ARRAYSIZE(Global::PreallocatedPools)))
         return nullptr;
 
     const PVOID pool = Global::PreallocatedPools[index];
+    if (!pool)
+        return nullptr;
+
+    if (GetPreallocatedPoolRemaining() == 0)
+    {
+        static volatile LONG exhaustedLogged = 0;
+        if (InterlockedCompareExchange(&exhaustedLogged, 1, 0) == 0)
+            Hypervisor::Log("GetPreallocatedPool: preallocated pool exhausted");
+    }
 
     RtlZeroMemory(pool, size);
 

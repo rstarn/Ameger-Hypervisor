@@ -313,13 +313,35 @@ namespace
     // pages on the way down.  Every table comes from the boot-time pool so
     // that no allocation happens inside the VMEXIT handler.
     //
-    PT_ENTRY_4KB* GetOrSplitPageTable(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 pml4Index, const ULONG64 pdpIndex, const ULONG64 pdIndex)
+    // allowSplit == false makes the function a pure lookup: it never touches
+    // the pool, so a caller that only wants to inspect the tree (the #NPF
+    // diagnostic path) cannot consume the fixed supply of split tables.
+    //
+    PT_ENTRY_4KB* GetOrSplitPageTable(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 pml4Index, const ULONG64 pdpIndex, const ULONG64 pdIndex, const bool allowSplit)
     {
         const ULONG64 pdBase = (pml4Index * 512ULL + pdpIndex) * PAGE_SIZE_1GB;
 
+        //
+        // Validate every level before following it.  An NPF for a GPA outside
+        // the mapped range (an MMIO BAR above the 2 MB fallback's ceiling)
+        // lands on a zeroed PML4/PDPT entry, and following that would
+        // dereference physical page 0 as if it were a page table - the #NPF
+        // handler would then read, and possibly write, an arbitrary 8-byte
+        // location.  A not-present upper level means "no leaf here", which is
+        // exactly what the caller must be told.
+        //
+        if (!sharedData->Pml4Entries[pml4Index].Present)
+            return nullptr;
+
         PDPTE_1GB* pdpte = &sharedData->PdpEntries[pml4Index][pdpIndex];
+        if (!pdpte->Present)
+            return nullptr;
+
         if (pdpte->LargePage)
         {
+            if (!allowSplit)
+                return nullptr;
+
             PD_ENTRY_2MB* newPdTable = static_cast<PD_ENTRY_2MB*>(Utils::GetPreallocatedPool(sizeof(PD_ENTRY_2MB) * 512));
             if (!newPdTable)
                 return nullptr;
@@ -333,11 +355,19 @@ namespace
                 newPdTable[pdEntry].PageFrameNumber = (pdBase + pdEntry * PAGE_SIZE_2MB) >> PD_PAGE_SHIFT;
             }
 
-            PDPTE_2MB splitEntry;
-            splitEntry.AsUInt = pdpte->AsUInt;
+            //
+            // Build the split entry from scratch instead of copying the
+            // large-page encoding and patching it: the 1 GB entry's Dirty,
+            // Global and Pat bits are either reserved or mean something else
+            // in a table pointer, and the old copy left them set.
+            //
+            PDPTE_2MB splitEntry = {};
+            splitEntry.Present = 1;
+            splitEntry.Write = 1;
+            splitEntry.Supervisor = 1;
             splitEntry.LargePage = 0;
-            splitEntry.Reserved2 = 0;
             splitEntry.PageFrameNumber = MmGetPhysicalAddress(newPdTable).QuadPart >> PAGE_SHIFT;
+            splitEntry.ExecuteDisable = pdpte->ExecuteDisable;
 
             InterlockedExchange64(
                 reinterpret_cast<volatile LONGLONG*>(&pdpte->AsUInt),
@@ -356,11 +386,24 @@ namespace
             return nullptr;
 
         PDE_4KB* pde = &pd[pdIndex];
+        if (!pde->Present)
+            return nullptr;
+
         if (pde->LargePage)
         {
+            if (!allowSplit)
+                return nullptr;
+
             PT_ENTRY_4KB* newPtTable = static_cast<PT_ENTRY_4KB*>(Utils::GetPreallocatedPool(sizeof(PT_ENTRY_4KB) * 512));
             if (!newPtTable)
                 return nullptr;
+
+            //
+            // The PD entry here is a 2 MB large page, so its bit 63 is NX.
+            // Carry it down to every 4 KB leaf: dropping it would make an NX
+            // page executable in the NPT after the split.
+            //
+            const PD_ENTRY_2MB* const largeEntry = reinterpret_cast<const PD_ENTRY_2MB*>(pde);
 
             const ULONG64 ptBase = pdBase + pdIndex * PAGE_SIZE_2MB;
             for (ULONG64 ptEntry = 0; ptEntry < 512; ptEntry++)
@@ -368,6 +411,7 @@ namespace
                 newPtTable[ptEntry].Present = 1;
                 newPtTable[ptEntry].Write = 1;
                 newPtTable[ptEntry].Supervisor = 1;
+                newPtTable[ptEntry].NoExecute = largeEntry->NoExecute;
                 newPtTable[ptEntry].PageFrameNumber = (ptBase + ptEntry * PAGE_SIZE_4KB) >> PAGE_SHIFT;
             }
 
@@ -382,6 +426,7 @@ namespace
             splitPde.Write = 1;
             splitPde.Supervisor = 1;
             splitPde.PageFrameNumber = (MmGetPhysicalAddress(newPtTable).QuadPart & ~0xFFFull) >> PAGE_SHIFT;
+            splitPde.ExecuteDisable = pde->ExecuteDisable;
 
             InterlockedExchange64(
                 reinterpret_cast<volatile LONGLONG*>(&pde->AsUInt),
@@ -395,47 +440,35 @@ namespace
 }
 #endif
 
-SVM::PT_ENTRY_4KB* SVM::GetPageTableEntry(const SVM::PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 physical)
+SVM::PT_ENTRY_4KB* SVM::GetPageTableEntry(const SVM::PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 gpa, const bool allowSplit)
 {
 #if HYPERVISOR_ENABLE_SELF_HIDE
+    //
+    // The NPT is a 4-level tree, so only a 48-bit GPA has an index in it.
+    // A wider ExitInfo2 value would index Pml4Entries past its 4 KB page.
+    //
+    if (!sharedData || gpa >= NptGpaLimit)
+        return nullptr;
+
     return GetOrSplitPageTable(
         sharedData,
-        physical >> PML4_PAGE_SHIFT,
-        (physical >> PDP_PAGE_SHIFT) & INDEX_MASK,
-        (physical >> PD_PAGE_SHIFT) & INDEX_MASK);
-#else
-    UNREFERENCED_PARAMETER(sharedData);
-    UNREFERENCED_PARAMETER(physical);
-
-    return nullptr;
-#endif
-}
-
-bool SVM::RestoreHiddenPage(const PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 gpa)
-{
-#if HYPERVISOR_ENABLE_SELF_HIDE
-    PT_ENTRY_4KB* entry = GetPageTableEntry(sharedData, gpa);
-    if (!entry || entry->Present)
-        return false;
-
-    //
-    // HideRange() cleared only the Present bit, leaving the real PFN and Write
-    // flag intact, so restoring is one atomic Present set.
-    //
-    InterlockedExchange64(reinterpret_cast<volatile LONGLONG*>(&entry->AsUInt64), entry->AsUInt64 | 1);
-    return true;
+        gpa >> PML4_PAGE_SHIFT,
+        (gpa >> PDP_PAGE_SHIFT) & INDEX_MASK,
+        (gpa >> PD_PAGE_SHIFT) & INDEX_MASK,
+        allowSplit);
 #else
     UNREFERENCED_PARAMETER(sharedData);
     UNREFERENCED_PARAMETER(gpa);
+    UNREFERENCED_PARAMETER(allowSplit);
 
-    return false;
+    return nullptr;
 #endif
 }
 
 void SVM::TrackForRehide(const PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, SVM::PT_ENTRY_4KB* entry)
 {
 #if HYPERVISOR_ENABLE_SELF_HIDE
-    if (!entry)
+    if (!entry || !sharedData)
         return;
 
     //
@@ -445,19 +478,44 @@ void SVM::TrackForRehide(const PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, SVM::P
     const LONG slot = InterlockedIncrement(&sharedData->NptRehideIndex) & (NPT_REHIDE_CAPACITY - 1);
     sharedData->NptRehide[slot] = entry;
     sharedData->NptRehideRestoreExit[slot] = sharedData->NptExitCounter;
+
+    //
+    // Sticky restore.  A page that has to be restored this often is in active
+    // use; re-hiding it would feed the #NPF path forever.  Stop the cycle for
+    // good once the limit is reached - the NPT then stays fully present and
+    // the #NPF handler has nothing left to resolve.
+    //
+    if (InterlockedIncrement(&sharedData->NptRestoreCount) >= NPT_RESTORE_LIMIT)
+        InterlockedExchange(&sharedData->NptRehideEnabled, FALSE);
 #else
     UNREFERENCED_PARAMETER(sharedData);
     UNREFERENCED_PARAMETER(entry);
 #endif
 }
 
-NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 virtualBase, const SIZE_T size)
+NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 virtualBase, const SIZE_T size, const ULONG64 textBase, const SIZE_T textSize)
 {
 #if HYPERVISOR_ENABLE_SELF_HIDE
     Hypervisor::LogNum("HideRange: enter, size", size);
 
     const ULONG64 pageMask = ~(static_cast<ULONG64>(PAGE_SIZE) - 1);
     const ULONG64 blankPagePhysical = MmGetPhysicalAddress(Global::BlankPage).QuadPart & pageMask;
+
+    //
+    // Executable skip range.  Hiding .text guarantees a permanent #NPF
+    // supply: the driver's notify callback and log thread run that code in
+    // guest mode, so every one of their instruction fetches faults.  The
+    // caller supplies the executable range and those pages are left mapped.
+    //
+    // Round *outward* here (opposite of the hide range below): a page that
+    // holds even one executable byte must not be hidden, so the skip starts
+    // at the page containing textBase and ends at the page containing the
+    // last executable byte.  A zero base or size means "no executable range
+    // known" and skips nothing (legacy full-image hide).
+    //
+    const bool skipExecutable = (textBase != 0 && textSize != 0);
+    const ULONG64 textFirst = textBase & pageMask;
+    const ULONG64 textEnd = (textBase + textSize + PAGE_SIZE - 1) & pageMask;
 
     //
     // Pages that must keep their real mapping: the NPT root and its PDPT
@@ -509,7 +567,13 @@ NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64
     // gives the guest's allocator a page whose header reads as zeros, which it
     // turns into an arbitrary write on the next free/coalesce.
     //
-    const ULONG64 firstPage = (virtualBase + PAGE_SIZE - 1) & pageMask;
+    // A *page-aligned* base is already fully owned by the caller, so it must
+    // not be rounded up: (base + PAGE_SIZE - 1) & pageMask skipped the first
+    // page of every page-aligned image, which is exactly the image header.
+    //
+    const ULONG64 firstPage = ((virtualBase & (PAGE_SIZE - 1)) == 0)
+        ? (virtualBase & pageMask)
+        : ((virtualBase + PAGE_SIZE - 1) & pageMask);
     const ULONG64 endPage = (virtualBase + size) & pageMask;
 
     //
@@ -522,6 +586,9 @@ NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64
 
     for (ULONG64 pageVirtual = firstPage; pageVirtual < endPage; pageVirtual += PAGE_SIZE)
     {
+        if (skipExecutable && pageVirtual >= textFirst && pageVirtual < textEnd)
+            continue;
+
         const ULONG64 pagePhysical = MmGetPhysicalAddress(reinterpret_cast<PVOID>(pageVirtual)).QuadPart & pageMask;
 
         //
@@ -560,7 +627,8 @@ NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64
             sharedData,
             pagePhysical >> PML4_PAGE_SHIFT,
             (pagePhysical >> PDP_PAGE_SHIFT) & INDEX_MASK,
-            (pagePhysical >> PD_PAGE_SHIFT) & INDEX_MASK);
+            (pagePhysical >> PD_PAGE_SHIFT) & INDEX_MASK,
+            true);
         if (!pageTable)
             return STATUS_NOT_FOUND;
 
@@ -574,8 +642,8 @@ NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64
         //
         // Clear ONLY the Present bit and leave the real PFN and Write flag in
         // the entry.  The page becomes not-present in the NPT, so any guest
-        // access raises a nested page fault that RestoreHiddenPage() resolves
-        // by setting Present again (a transparent restore: no #PF is injected,
+        // access raises a nested page fault that the #NPF handler resolves by
+        // setting Present again (a transparent restore: no #PF is injected,
         // so the guest never observes it).  Blanking the PFN to the shared
         // BlankPage would instead make reads return zeros, which the guest
         // executes as garbage and hangs the machine.
@@ -583,6 +651,34 @@ NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64
         InterlockedExchange64(reinterpret_cast<volatile LONGLONG*>(&pageTableEntry->AsUInt64),
             pageTableEntry->AsUInt64 & ~1ULL);
         found = true;
+
+        //
+        // Record the leaf entry so DisableSelfHide() can put it back without
+        // walking the tree or allocating: the PFN survived the hide, so a
+        // restore is one atomic OR of bit 0.  Dedupe by pointer (overlapping
+        // ranges reach the same page twice) and cap at the array size.  The
+        // slot is written before the count is published, so a reader that
+        // observes the count also observes the pointer.
+        //
+        const LONG recordedCount = sharedData->HiddenPteCount;
+        bool alreadyRecorded = false;
+        for (LONG index = 0; index < recordedCount && index < static_cast<LONG>(ARRAYSIZE(sharedData->HiddenPtes)); index++)
+        {
+            if (sharedData->HiddenPtes[index] == pageTableEntry)
+            {
+                alreadyRecorded = true;
+                break;
+            }
+        }
+
+        if (!alreadyRecorded)
+        {
+            const LONG index = InterlockedIncrement(&sharedData->HiddenPteCount) - 1;
+            if (index < static_cast<LONG>(ARRAYSIZE(sharedData->HiddenPtes)))
+                sharedData->HiddenPtes[index] = pageTableEntry;
+            else
+                InterlockedDecrement(&sharedData->HiddenPteCount);
+        }
     }
 
     //
@@ -641,12 +737,14 @@ NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64
     UNREFERENCED_PARAMETER(sharedData);
     UNREFERENCED_PARAMETER(virtualBase);
     UNREFERENCED_PARAMETER(size);
+    UNREFERENCED_PARAMETER(textBase);
+    UNREFERENCED_PARAMETER(textSize);
 
     return STATUS_SUCCESS;
 #endif
 }
 
-NTSTATUS SVM::ProtectSelf(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData)
+NTSTATUS SVM::ProtectSelf(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 textBase, const SIZE_T textSize)
 {
 #if HYPERVISOR_ENABLE_SELF_HIDE
     Hypervisor::Log("ProtectSelf: enter");
@@ -678,7 +776,16 @@ NTSTATUS SVM::ProtectSelf(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData)
 
     Hypervisor::LogNum("ProtectSelf: HideRange base, size", driverSize);
 
-    const NTSTATUS result = HideRange(sharedData, driverVirtualBase, driverSize);
+    //
+    // Arm the re-hide cycle only now that the range is known to be valid, and
+    // start the restore budget from zero.  HideRange() records every leaf it
+    // clears in HiddenPtes[], which is what lets DisableSelfHide() undo the
+    // whole hide later without allocating.
+    //
+    sharedData->NptRestoreCount = 0;
+    InterlockedExchange(&sharedData->NptRehideEnabled, TRUE);
+
+    const NTSTATUS result = HideRange(sharedData, driverVirtualBase, driverSize, textBase, textSize);
 
     Hypervisor::LogNum("ProtectSelf: HideRange result", result);
 
@@ -688,8 +795,86 @@ NTSTATUS SVM::ProtectSelf(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData)
     return result;
 #else
     UNREFERENCED_PARAMETER(sharedData);
+    UNREFERENCED_PARAMETER(textBase);
+    UNREFERENCED_PARAMETER(textSize);
 
     return STATUS_SUCCESS;
+#endif
+}
+
+void SVM::DisableSelfHide(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData)
+{
+#if HYPERVISOR_ENABLE_SELF_HIDE
+    if (!sharedData)
+        return;
+
+    //
+    // Fail open.  Clearing the flag first stops ProtectSelf()-time hiding
+    // from being re-armed and makes HandleExit() skip the revert scan, so
+    // nothing re-hides a page behind the restores below.
+    //
+    // The early-out covers the machine that never hid anything (no image
+    // range, or the caller never asked): the #NPF diagnostic path calls this
+    // on every fault it cannot attribute, and with nothing recorded there is
+    // nothing to restore - skipping the generation bump keeps those faults
+    // from arming a full flush on every VMCB.  When pages *were* recorded the
+    // restore below is idempotent, so a repeated call is harmless (just not
+    // free); the 1000-fault tripwire bounds it.
+    //
+    const LONG wasEnabled = InterlockedExchange(&sharedData->NptRehideEnabled, FALSE);
+    if (wasEnabled == FALSE && sharedData->HiddenPteCount == 0)
+        return;
+
+    //
+    // Restore every page HideRange() hid.  No allocation and no page-table
+    // walk: the entry still holds the real PFN, so setting bit 0 is the whole
+    // restore.  HiddenPteCount is read once; slots are published before the
+    // count, so every slot below the count is a valid pointer (or null while
+    // another CPU is mid-publish, which is skipped).
+    //
+    const LONG hiddenCount = sharedData->HiddenPteCount;
+    for (LONG index = 0; index < hiddenCount && index < static_cast<LONG>(ARRAYSIZE(sharedData->HiddenPtes)); index++)
+    {
+        PT_ENTRY_4KB* const entry = sharedData->HiddenPtes[index];
+        if (!entry)
+            continue;
+
+        InterlockedExchange64(reinterpret_cast<volatile LONGLONG*>(&entry->AsUInt64), entry->AsUInt64 | 1);
+    }
+
+    for (ULONG index = 0; index < ARRAYSIZE(sharedData->NpfStaleStrikes); index++)
+        InterlockedExchange(&sharedData->NpfStaleStrikes[index], 0);
+
+    //
+    // Publish the new state exactly like HideRange(): the generation bump is
+    // the release that orders it after the Present stores, and every
+    // published VMCB gets TlbControl = 1 so the CPU re-walks the NPT at its
+    // next VMRUN.  Without this a CPU could keep translating through stale
+    // not-present entries and refault a page that is already restored.
+    //
+    InterlockedIncrement(&sharedData->NptFlushGeneration);
+
+    PVIRTUAL_PROCESSOR_DATA* const virtualizedCpus = reinterpret_cast<PVIRTUAL_PROCESSOR_DATA*>(Global::VirtualizedCpus);
+    if (virtualizedCpus)
+    {
+        for (ULONG cpuIndex = 0; cpuIndex < Global::VirtualizedCpuCount; cpuIndex++)
+        {
+            const PVIRTUAL_PROCESSOR_DATA cpu = virtualizedCpus[cpuIndex];
+            if (!cpu)
+                continue;
+
+            InterlockedExchange(reinterpret_cast<volatile LONG*>(&cpu->GuestVmcb.ControlArea.TlbControl), 1);
+            MarkControlAreaDirty(cpu->GuestVmcb.ControlArea);
+        }
+    }
+
+    static volatile LONG disableLogged = 0;
+    if (InterlockedCompareExchange(&disableLogged, 1, 0) == 0)
+    {
+        Hypervisor::LogNum("DisableSelfHide: restored pages", static_cast<unsigned long long>(hiddenCount));
+    }
+#else
+    UNREFERENCED_PARAMETER(sharedData);
 #endif
 }
 

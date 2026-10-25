@@ -4,17 +4,33 @@ namespace SVM
 {
     //
     // Transparent-hide tuning.  Hidden pages are made not-present in the NPT
-    // and are restored by SVM::RestoreHiddenPage() the first time the guest
-    // touches one (nested page fault).  Once a restored page has gone quiet for
-    // NPT_REHIDE_GRACE VMEXITs it is reverted to not-present, so actively-used
-    // pages stay mapped while the dormant bulk of a hidden image goes back to
-    // invisible.  All failure modes degrade to "the page stays mapped" (a minor
-    // stealth loss) and never to a correctness failure.
+    // and are restored inline by the #NPF handler the first time the guest
+    // touches one.  Once a restored page has gone quiet for NPT_REHIDE_GRACE
+    // VMEXITs it is reverted to not-present, so actively-used pages stay
+    // mapped while the dormant bulk of a hidden image goes back to invisible.
+    // All failure modes degrade to "the page stays mapped" (a minor stealth
+    // loss) and never to a correctness failure.
     //
     constexpr ULONG NPT_REHIDE_CAPACITY = 64;    // tracked pages (power of two)
     constexpr LONG  NPT_REHIDE_GRACE = 4096;     // quiet VMEXITs before revert
     constexpr ULONG NPT_REHIDE_SCAN_INTERVAL = 4096; // VMEXITs between revert scans
     constexpr ULONG NPT_REHIDE_SCAN = 16;        // slots scanned per scan
+
+    //
+    // Fail-open limits.
+    //
+    // NPT_RESTORE_LIMIT: after this many restores TrackForRehide() stops the
+    // re-hide cycle globally (sticky restore).  A hidden image that is
+    // touched this often is in active use, and re-hiding it would only feed
+    // the #NPF path forever.
+    //
+    // NPF_STALE_STRIKE_LIMIT: consecutive #NPF exits on a page whose entry is
+    // already present.  The handler flushes unconditionally, so a few are
+    // normal walk/TLB races; a long run means the CPU cannot make progress
+    // and self-hide is disabled for the whole system.
+    //
+    constexpr LONG NPT_RESTORE_LIMIT = 32;
+    constexpr LONG NPF_STALE_STRIKE_LIMIT = 32;
 
     typedef struct _APIC_BASE
     {

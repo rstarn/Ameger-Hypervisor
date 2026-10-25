@@ -9,20 +9,29 @@ namespace SVM
 
     NTSTATUS CheckSupport();
     void BuildNestedPageTables(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData);
-    NTSTATUS ProtectSelf(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData);
-    NTSTATUS HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, ULONG64 virtualBase, SIZE_T size);
+    //
+    // ProtectSelf() hides this driver's image minus the caller-supplied
+    // executable range [textBase, textBase + textSize).  textBase == 0 or
+    // textSize == 0 means "no executable range known": the whole image is
+    // hidden (legacy behaviour).  HideRange() is the same primitive for an
+    // arbitrary guest virtual range; ProtectRange passes 0, 0.
+    //
+    NTSTATUS ProtectSelf(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, ULONG64 textBase, SIZE_T textSize);
+    NTSTATUS HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, ULONG64 virtualBase, SIZE_T size, ULONG64 textBase, SIZE_T textSize);
 
     //
     // Transparent-hide support.  GetPageTableEntry() returns the 4 KB NPT leaf
-    // entry for a guest physical page (splitting the containing large page
-    // first).  RestoreHiddenPage() re-sets Present on a hidden page so the
-    // guest's nested page fault resolves transparently.  TrackForRehide() asks
-    // the revert scan to put a restored page back to not-present once it is
-    // quiet.  Each returns false/no-op when self-hide is compiled out.
+    // entry for a guest physical page.  allowSplit == true may split the
+    // containing large page (consuming a preallocated pool page);
+    // allowSplit == false never allocates, so the diagnostic/#NPF path cannot
+    // exhaust the pool.  TrackForRehide() asks the revert scan to put a
+    // restored page back to not-present once it is quiet.  DisableSelfHide()
+    // restores every recorded page and stops re-hiding for good (fail open).
+    // Each returns false/no-op when self-hide is compiled out.
     //
-    PT_ENTRY_4KB* GetPageTableEntry(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, ULONG64 physical);
-    bool RestoreHiddenPage(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, ULONG64 gpa);
+    PT_ENTRY_4KB* GetPageTableEntry(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, ULONG64 gpa, bool allowSplit);
     void TrackForRehide(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, PT_ENTRY_4KB* entry);
+    void DisableSelfHide(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData);
     void BuildPermissionMap(PVOID permissionMap);
 
     //

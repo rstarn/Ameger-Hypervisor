@@ -173,11 +173,19 @@ void HandleCopyProcessMemory(const SVM::PVIRTUAL_PROCESSOR_DATA vpData, const SV
 
 void HandleProtectSelf(const SVM::PVIRTUAL_PROCESSOR_DATA vpData, const SVM::PGUEST_CONTEXT guestContext)
 {
-    UNREFERENCED_PARAMETER(vpData);
-
     Hypervisor::Log("HandleProtectSelf: enter");
 
-    const NTSTATUS status = SVM::ProtectSelf(vpData->HostStackLayout.SharedVpData);
+    //
+    // R8/R9 carry the image's executable range, [textBase, textBase +
+    // textSize).  HideRange() leaves those pages mapped - hiding code the
+    // driver itself executes in guest mode guarantees a permanent #NPF
+    // supply.  Zero in either register means the caller has no executable
+    // range to report and selects the legacy full-image hide.
+    //
+    const ULONG64 textBase = guestContext->VpRegs->R8;
+    const SIZE_T textSize = static_cast<SIZE_T>(guestContext->VpRegs->R9);
+
+    const NTSTATUS status = SVM::ProtectSelf(vpData->HostStackLayout.SharedVpData, textBase, textSize);
     if (!NT_SUCCESS(status))
     {
         guestContext->VpRegs->Rax = 0xFFFF;
@@ -199,7 +207,12 @@ void HandleProtectRange(const SVM::PVIRTUAL_PROCESSOR_DATA vpData, const SVM::PG
 
     Hypervisor::LogNum("HandleProtectRange: HideRange size", size);
 
-    const NTSTATUS status = SVM::HideRange(vpData->HostStackLayout.SharedVpData, virtualBase, size);
+    //
+    // ProtectRange hides an arbitrary guest virtual range (the mapper's
+    // HideMemory), so it has no executable section to preserve: 0/0 skips
+    // nothing.
+    //
+    const NTSTATUS status = SVM::HideRange(vpData->HostStackLayout.SharedVpData, virtualBase, size, 0, 0);
     if (!NT_SUCCESS(status))
     {
         guestContext->VpRegs->Rax = 0xFFFF;

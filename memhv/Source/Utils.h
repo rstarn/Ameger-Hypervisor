@@ -119,7 +119,6 @@ namespace Utils
     {
         NTSTATUS ZwQuerySystemInformation(SYSTEM_INFORMATION_CLASS systemInformationClass, PVOID systemInformation, ULONG systemInformationLength, PULONG returnLength);
         NTSTATUS ObReferenceObjectByName(PUNICODE_STRING objectName, ULONG attributes, PACCESS_STATE accessState, ACCESS_MASK desiredAccess, POBJECT_TYPE objectType, KPROCESSOR_MODE accessMode, PVOID parseContext, PVOID* object);
-        EXTERN_C ULONG64 MmHighestUserAddress;
     }
 
     EXTERN_C POBJECT_TYPE* IoDriverObjectType;
@@ -135,6 +134,27 @@ namespace Utils
     PVOID AllocatePageAligned(SIZE_T size);
     PEPROCESS GetNextProcess(PEPROCESS input);
     PEPROCESS FindProcess(HANDLE processId);
+    NTSTATUS InitializeDirectoryBaseCache();
+    NTSTATUS ShutdownDirectoryBaseCache();
+
+    //
+    // Validates a user-supplied EPROCESS pointer: canonical kernel address,
+    // 16-byte aligned, and actually present in the active process list.
+    // Must be called before dereferencing any pointer that came from a
+    // VMMCALL.
+    //
+    bool IsValidProcess(PEPROCESS process);
+
+    //
+    // True only when directoryBase matches the DirectoryTableBase of a
+    // process in the active process list.  A guest-supplied directory base
+    // that no live process owns is an arbitrary page of RAM filled with PTEs,
+    // so the copy path refuses it. Positive results are cached and the cache
+    // is invalidated on process create/exit notifications, limiting bounded
+    // list walks to cache misses.
+    //
+    bool IsValidDirectoryBase(ULONG64 directoryBase);
+
     bool CheckMSR(UINT32 msr);
     bool ValidUsermodeAddress(ULONG64 address);
 
@@ -160,6 +180,25 @@ namespace Utils
     ULONG64 GetTotalSystemMemory();
 
     //
+    // Caches the kernel's PHYSICAL_MEMORY_RANGE list once, so that physical
+    // addresses can be validated on the copy path without resolving (or
+    // allocating) anything there.  Must be called at PASSIVE_LEVEL, i.e.
+    // from Entry before the first #VMEXIT.  Returns false when the resolver
+    // or the range list is unavailable; IsPhysicalRangeValid() then rejects
+    // every address (fail closed).
+    //
+    bool InitPhysicalMemoryRanges();
+
+    //
+    // True only when [physicalAddress, physicalAddress + size) lies entirely
+    // inside a single cached RAM range.  Rejects a zero address, a zero size
+    // and an overflowing range.  Lock-free linear scan over the cached
+    // ranges; returns false when the cache was never filled, so an
+    // unvalidatable address is never treated as RAM.
+    //
+    bool IsPhysicalRangeValid(ULONG64 physicalAddress, SIZE_T size);
+
+    //
     // Parses the export directory of an already-mapped kernel module (e.g.
     // ntoskrnl.exe or hal.dll) to locate an exported function by name.
     // Returns nullptr if the export is not found.
@@ -174,7 +213,8 @@ namespace Utils
 
     //
     // Fills Global::MsrRange01Max / MsrRange2Max / MsrPermissionsMapSize
-    // from CPUID Fn8000_000A on the current CPU (Zen 2, 4800H).
+    // with the architectural MSRPM geometry (three 8192-MSR ranges, 8 KB
+    // map).  CPUID Fn8000_000A does not describe MSR ranges.
     void InitMsrRanges();
     void ReferenceObject(PVOID object);
     void DereferenceObject(PVOID object);

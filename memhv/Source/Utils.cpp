@@ -1,6 +1,39 @@
 #include "Global.h"
+#include "HVLog.h"
 
 #include <ntimage.h>
+
+namespace
+{
+    constexpr ULONG DirectoryBaseCacheSetCount = 64;
+    constexpr ULONG DirectoryBaseCacheWays = 4;
+    constexpr ULONG DirectoryBaseCacheSize = DirectoryBaseCacheSetCount * DirectoryBaseCacheWays;
+
+    struct DIRECTORY_BASE_CACHE_ENTRY
+    {
+        ULONG64 DirectoryBase;
+    };
+
+    KSPIN_LOCK DirectoryBaseCacheLock;
+    DIRECTORY_BASE_CACHE_ENTRY DirectoryBaseCache[DirectoryBaseCacheSize] = {};
+    ULONG DirectoryBaseCacheNextWay[DirectoryBaseCacheSetCount] = {};
+    ULONG64 DirectoryBaseCacheGeneration = 0;
+    volatile LONG DirectoryBaseCacheInitialized = 0;
+
+    VOID DirectoryBaseProcessNotify(HANDLE parentId, HANDLE processId, BOOLEAN create)
+    {
+        UNREFERENCED_PARAMETER(parentId);
+        UNREFERENCED_PARAMETER(processId);
+        UNREFERENCED_PARAMETER(create);
+
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&DirectoryBaseCacheLock, &oldIrql);
+        RtlZeroMemory(DirectoryBaseCache, sizeof(DirectoryBaseCache));
+        RtlZeroMemory(DirectoryBaseCacheNextWay, sizeof(DirectoryBaseCacheNextWay));
+        ++DirectoryBaseCacheGeneration;
+        KeReleaseSpinLock(&DirectoryBaseCacheLock, oldIrql);
+    }
+}
 
 char* Utils::Compare(const char* haystack, const char* needle)
 {
@@ -291,9 +324,9 @@ bool Utils::InitObjectFunctions()
     //
     // MmGetPhysicalMemoryRanges is resolved and cached on first use inside
     // Utils::GetTotalSystemMemory(); no need to duplicate the lookup here.
-    // If it cannot be resolved, GetTotalSystemMemory returns 0 and
-    // BuildNestedPageTables falls back to a single 512 GB slot, which is
-    // sufficient for any consumer memory on this machine.
+    // BuildNestedPageTables no longer sizes the NPT from the installed
+    // memory (it covers the whole 48-bit GPA space now), but the helper is
+    // kept for diagnostics.
 
     //
     // If we have both Obf functions, prefer calling them directly.
@@ -315,31 +348,143 @@ bool Utils::InitObjectFunctions()
     return true;
 }
 
-ULONG64 Utils::GetTotalSystemMemory()
+/*
+ * Physical memory ranges reported by the kernel, cached once so that the
+ * physical copy path can tell a real RAM page from an MMIO hole without
+ * resolving anything at run time: that path executes inside a #VMEXIT
+ * handler at whatever IRQL the guest happened to be running at, where
+ * MmGetPhysicalMemoryRanges must not be called.
+ *
+ * A machine reports a handful of ranges; the fixed cap keeps the lookup a
+ * bounded linear scan with no allocation.  A list longer than the cap is
+ * truncated, which can only reject an address, never accept a non-RAM one.
+ */
+namespace
 {
-    //
-    // Resolve MmGetPhysicalMemoryRanges once (cached as a static).
-    // On Windows 10/11 x64 this is exported from ntoskrnl.exe.
-    //
-    static PPHYSICAL_MEMORY_RANGE (*pMmGetPhysicalMemoryRanges)(VOID) = nullptr;
-    static bool tried = false;
+    constexpr ULONG MaxPhysicalRanges = 64;
 
-    if (!tried)
+    typedef struct _PHYSICAL_RANGE_CACHE_ENTRY
     {
-        tried = true;
-        UNICODE_STRING name;
-        RtlInitUnicodeString(&name, L"MmGetPhysicalMemoryRanges");
-        pMmGetPhysicalMemoryRanges = reinterpret_cast<decltype(pMmGetPhysicalMemoryRanges)>(
-            MmGetSystemRoutineAddress(&name));
-        if (!pMmGetPhysicalMemoryRanges)
+        ULONG64 Base;
+        ULONG64 Length;
+    } PHYSICAL_RANGE_CACHE_ENTRY;
+
+    PHYSICAL_RANGE_CACHE_ENTRY PhysicalRangeCache[MaxPhysicalRanges];
+    ULONG PhysicalRangeCacheCount = 0;
+
+    //
+    // 0 = not initialised, 1 = initialising, 2 = cache usable.  Written once
+    // at PASSIVE_LEVEL by InitPhysicalMemoryRanges() and only read afterwards,
+    // so the copy path needs no lock.
+    //
+    volatile LONG PhysicalRangeCacheState = 0;
+
+    typedef PPHYSICAL_MEMORY_RANGE (*PFN_GET_PHYSICAL_MEMORY_RANGES)(VOID);
+
+    /*
+     * Resolves MmGetPhysicalMemoryRanges once (cached as a static).  On
+     * Windows 10/11 x64 this is exported from ntoskrnl.exe.  Both
+     * MmGetSystemRoutineAddress and the ZwQuerySystemInformation based
+     * export fallback require PASSIVE_LEVEL.
+     */
+    PFN_GET_PHYSICAL_MEMORY_RANGES GetPhysicalMemoryRangesRoutine()
+    {
+        static PFN_GET_PHYSICAL_MEMORY_RANGES routine = nullptr;
+        static bool tried = false;
+
+        if (!tried)
         {
-            PVOID kernelBase = GetModuleBase("ntoskrnl.exe");
-            if (kernelBase)
-                pMmGetPhysicalMemoryRanges = reinterpret_cast<decltype(pMmGetPhysicalMemoryRanges)>(
-                    GetKernelModuleExport(kernelBase, "MmGetPhysicalMemoryRanges"));
+            tried = true;
+            UNICODE_STRING name;
+            RtlInitUnicodeString(&name, L"MmGetPhysicalMemoryRanges");
+            routine = reinterpret_cast<PFN_GET_PHYSICAL_MEMORY_RANGES>(
+                MmGetSystemRoutineAddress(&name));
+            if (!routine)
+            {
+                PVOID kernelBase = Utils::GetModuleBase("ntoskrnl.exe");
+                if (kernelBase)
+                    routine = reinterpret_cast<PFN_GET_PHYSICAL_MEMORY_RANGES>(
+                        Utils::GetKernelModuleExport(kernelBase, "MmGetPhysicalMemoryRanges"));
+            }
+        }
+
+        return routine;
+    }
+}
+
+bool Utils::InitPhysicalMemoryRanges()
+{
+    if (InterlockedCompareExchange(&PhysicalRangeCacheState, 1, 0) != 0)
+        return PhysicalRangeCacheState == 2;
+
+    const PFN_GET_PHYSICAL_MEMORY_RANGES routine = GetPhysicalMemoryRangesRoutine();
+    const PPHYSICAL_MEMORY_RANGE ranges = routine ? routine() : nullptr;
+
+    ULONG count = 0;
+    if (ranges)
+    {
+        for (; count < MaxPhysicalRanges && ranges[count].NumberOfBytes.QuadPart != 0; count++)
+        {
+            PhysicalRangeCache[count].Base = static_cast<ULONG64>(ranges[count].BaseAddress.QuadPart);
+            PhysicalRangeCache[count].Length = static_cast<ULONG64>(ranges[count].NumberOfBytes.QuadPart);
         }
     }
 
+    PhysicalRangeCacheCount = count;
+
+    /*
+     * Publish the cache only when at least one range was obtained.  An empty
+     * cache keeps the state at "not initialised", so IsPhysicalRangeValid()
+     * rejects every address instead of trusting a list it never got.
+     */
+    InterlockedExchange(&PhysicalRangeCacheState, count != 0 ? 2 : 0);
+
+    return count != 0;
+}
+
+bool Utils::IsPhysicalRangeValid(const ULONG64 physicalAddress, const SIZE_T size)
+{
+    /*
+     * Fail closed: without a filled cache nothing is known to be RAM, so the
+     * access is refused rather than let through.  The cache is deliberately
+     * not filled from here - see the range-cache comment above.
+     */
+    if (PhysicalRangeCacheState != 2)
+        return false;
+
+    if (physicalAddress == 0 || size == 0)
+        return false;
+
+    const ULONG64 end = physicalAddress + size;
+    if (end < physicalAddress)
+        return false;
+
+    const ULONG count = PhysicalRangeCacheCount;
+    for (ULONG i = 0; i < count; i++)
+    {
+        const ULONG64 base = PhysicalRangeCache[i].Base;
+        const ULONG64 rangeEnd = base + PhysicalRangeCache[i].Length;
+
+        // A wrapping entry cannot contain anything; skip it rather than
+        // letting the wrapped end widen the match.
+        if (rangeEnd <= base)
+            continue;
+
+        if (physicalAddress >= base && end <= rangeEnd)
+            return true;
+    }
+
+    return false;
+}
+
+ULONG64 Utils::GetTotalSystemMemory()
+{
+    //
+    // MmGetPhysicalMemoryRanges is resolved and cached by
+    // GetPhysicalMemoryRangesRoutine(); the range list itself is cached by
+    // InitPhysicalMemoryRanges() for the physical address validation.
+    //
+    const PFN_GET_PHYSICAL_MEMORY_RANGES pMmGetPhysicalMemoryRanges = GetPhysicalMemoryRangesRoutine();
     if (!pMmGetPhysicalMemoryRanges)
         return 0;
 
@@ -362,7 +507,13 @@ PVOID Utils::AllocateContiguousMemory(const SIZE_T size)
     boundary.QuadPart = lowest.QuadPart = 0;
     highest.QuadPart = -1;
 
-    const PVOID allocated = MmAllocateContiguousMemorySpecifyCacheNode(size, lowest, highest, boundary, MmNonCached, MM_ANY_NODE_OK);
+    //
+    // Write-back memory: the APM requires the VMCB and the host state save
+    // area to be mapped write-back, and every other caller (NPT tables,
+    // host stack, MSR permission map) is normal RAM as well.  Nothing here
+    // needs uncached semantics.
+    //
+    const PVOID allocated = MmAllocateContiguousMemorySpecifyCacheNode(size, lowest, highest, boundary, MmCached, MM_ANY_NODE_OK);
     if (!allocated)
         KeBugCheck(HAL_MEMORY_ALLOCATION);
 
@@ -389,7 +540,44 @@ NTSTATUS Utils::ExecuteOnEachProcessor(NTSTATUS(*callback)(PVOID), const PVOID c
         GROUP_AFFINITY oldAffinity;
         KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
 
+        //
+        // KeSetSystemGroupAffinityThread() only reprograms the affinity mask;
+        // the thread actually moves to that core at the next scheduling
+        // decision.  The callback below issues VMRUN on whatever core is
+        // executing it, so wait until we are really scheduled on the target.
+        // Without this, the same core gets virtualized repeatedly while the
+        // rest stay unvirtualized, which triple-faults the moment an
+        // NPT-restricted page is touched from an active core.  The delay is
+        // what lets the scheduler observe the new mask and migrate us - a tight
+        // spin would hold the current core forever.
+        //
+        BOOLEAN onTarget = FALSE;
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000;
+        for (ULONG attempt = 0; attempt < 1000; ++attempt)
+        {
+            PROCESSOR_NUMBER current;
+            KeGetCurrentProcessorNumberEx(&current);
+            if (current.Group == processorNumber.Group && current.Number == processorNumber.Number)
+            {
+                onTarget = TRUE;
+                break;
+            }
+
+            KeDelayExecutionThread(Executive, false, &delay);
+        }
+
+        if (!onTarget)
+        {
+            KeRevertToUserGroupAffinityThread(&oldAffinity);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        HV::LogNum("ExecuteOnEachProcessor: VMRUN cpu", i);
+
         status = callback(context);
+
+        HV::LogNum("ExecuteOnEachProcessor: cpu done", i);
 
         KeRevertToUserGroupAffinityThread(&oldAffinity);
 
@@ -403,6 +591,20 @@ NTSTATUS Utils::ExecuteOnEachProcessor(NTSTATUS(*callback)(PVOID), const PVOID c
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 NTSTATUS Utils::GetCurrentDriverInfo(ULONG64* baseAddress, SIZE_T* size)
 {
+    //
+    // Entry() records the real image range from the DRIVER_OBJECT it was
+    // entered with.  Prefer it: under manual mapping the PE header is
+    // stripped, so __ImageBase sits one page before the allocation and the
+    // checks below would reject an otherwise valid image.
+    //
+    if (Global::DriverBase != 0 && Global::DriverSize != 0)
+    {
+        *baseAddress = Global::DriverBase;
+        *size = static_cast<SIZE_T>(Global::DriverSize);
+
+        return STATUS_SUCCESS;
+    }
+
     if (__ImageBase.e_magic != IMAGE_DOS_SIGNATURE)
         return STATUS_INVALID_IMAGE_FORMAT;
 
@@ -418,14 +620,20 @@ NTSTATUS Utils::GetCurrentDriverInfo(ULONG64* baseAddress, SIZE_T* size)
 
 PVOID Utils::AllocatePageAligned(const SIZE_T size)
 {
-    if (size < PAGE_SIZE)
-        KeBugCheck(HAL_MEMORY_ALLOCATION);
+    //
+    // Round the request up to a whole number of pages.  The NPT structures
+    // built on top of these buffers are walked by the CPU in 4 KB steps, so
+    // a partial last page would leave the tail of the table uninitialised
+    // (and the PML4 is only sizeof(PML4E_64) * slotCount bytes).  A zero
+    // request still gets one page so the caller always has a valid buffer.
+    //
+    const SIZE_T roundedSize = ((size ? size : 1) + PAGE_SIZE - 1) & ~(static_cast<SIZE_T>(PAGE_SIZE) - 1);
 
-    const PVOID allocated = AllocateContiguousMemory(size);
+    const PVOID allocated = AllocateContiguousMemory(roundedSize);
     if (!allocated)
         KeBugCheck(HAL_MEMORY_ALLOCATION);
 
-    RtlZeroMemory(allocated, size);
+    RtlZeroMemory(allocated, roundedSize);
 
     return allocated;
 }
@@ -439,71 +647,299 @@ PEPROCESS Utils::GetNextProcess(PEPROCESS input)
 
 PEPROCESS Utils::FindProcess(const HANDLE processId)
 {
-    for (PEPROCESS current = PsInitialSystemProcess; current != nullptr; current = GetNextProcess(current))
+    //
+    // ActiveProcessLinks is circular: a "current != nullptr" loop never
+    // terminates when the PID is absent.  Walk until the list comes back to
+    // the node we started from.
+    //
+    PEPROCESS start = PsInitialSystemProcess;
+    if (!start)
+        return nullptr;
+
+    PEPROCESS current = start;
+    do
     {
-        const HANDLE currentId = PsGetProcessId(current);
-        if (currentId == processId)
+        if (PsGetProcessId(current) == processId)
             return current;
-    }
+
+        current = GetNextProcess(current);
+    } while (current && current != start);
 
     return nullptr;
+}
+
+NTSTATUS Utils::InitializeDirectoryBaseCache()
+{
+    KeInitializeSpinLock(&DirectoryBaseCacheLock);
+    RtlZeroMemory(DirectoryBaseCache, sizeof(DirectoryBaseCache));
+    RtlZeroMemory(DirectoryBaseCacheNextWay, sizeof(DirectoryBaseCacheNextWay));
+    DirectoryBaseCacheGeneration = 0;
+
+    //
+    // The notify routine only exists to invalidate cached directory bases when
+    // processes come and go; it is not needed to resolve a base (GetDirectoryBase
+    // reads the EPROCESS field directly). Registering it is therefore optional,
+    // and PsSetCreateProcessNotifyRoutine returns STATUS_ACCESS_DENIED when the
+    // machine's 16-slot process-notify table is full (common on heavily
+    // instrumented systems) or when called in a disallowed context (IRQL above
+    // PASSIVE / APCs disabled, which a manual-mapped DriverEntry can hit).
+    //
+    // That must not take the whole driver down. Leaving DirectoryBaseCacheInitialized
+    // at 0 makes ValidateDirectoryBase fail closed while direct resolution keeps
+    // working, so the hypervisor still installs and the hide path still runs.
+    //
+    const NTSTATUS status = PsSetCreateProcessNotifyRoutine(DirectoryBaseProcessNotify, FALSE);
+    if (!NT_SUCCESS(status))
+    {
+        //
+        // Registration refused (16-slot notify table full on heavily
+        // instrumented systems, or a disallowed context for a manual-mapped
+        // DriverEntry).  Log it: IsValidDirectoryBase now falls back to the
+        // authoritative process-list walk, so the copy path stays functional
+        // - only slightly slower (no cache).
+        //
+        HV::LogNum("DirectoryBaseCache: notify registration failed, walk fallback active", static_cast<unsigned long long>(status));
+        return STATUS_SUCCESS;
+    }
+
+    HV::Log("DirectoryBaseCache: notify registered, cache active");
+
+    InterlockedExchange(&DirectoryBaseCacheInitialized, 1);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS Utils::ShutdownDirectoryBaseCache()
+{
+    if (InterlockedExchange(&DirectoryBaseCacheInitialized, 0) == 0)
+        return STATUS_SUCCESS;
+
+    const NTSTATUS status = PsSetCreateProcessNotifyRoutine(DirectoryBaseProcessNotify, TRUE);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&DirectoryBaseCacheLock, &oldIrql);
+    RtlZeroMemory(DirectoryBaseCache, sizeof(DirectoryBaseCache));
+    RtlZeroMemory(DirectoryBaseCacheNextWay, sizeof(DirectoryBaseCacheNextWay));
+    ++DirectoryBaseCacheGeneration;
+    KeReleaseSpinLock(&DirectoryBaseCacheLock, oldIrql);
+
+    return status;
+}
+
+bool Utils::IsValidProcess(const PEPROCESS process)
+{
+    //
+    // Every EPROCESS lives in the non-paged pool in kernel space and is
+    // 16-byte aligned.  R8 on the VMMCALL path is fully user-controlled, so
+    // reject anything that cannot be a kernel object before touching it.
+    //
+    constexpr ULONG64 canonicalKernelBase = 0xFFFF800000000000;
+    constexpr ULONG maxProcessCount = 0x10000;
+
+    const ULONG64 address = reinterpret_cast<ULONG64>(process);
+    if (address < canonicalKernelBase || (address & 0xF) != 0)
+        return false;
+
+    if (Global::Offsets::ActiveProcessLinks == 0 || PsInitialSystemProcess == nullptr)
+        return false;
+
+    //
+    // The only trustworthy way to confirm that the pointer really is an
+    // EPROCESS is to find it in the kernel's active process list.  The walk
+    // starts from a kernel-owned object and is bounded in case the list is
+    // corrupt.
+    //
+    PEPROCESS current = PsInitialSystemProcess;
+    for (ULONG i = 0; i < maxProcessCount; i++)
+    {
+        if (current == process)
+            return true;
+
+        if (reinterpret_cast<ULONG64>(current) < canonicalKernelBase)
+            return false;
+
+        current = GetNextProcess(current);
+        if (current == PsInitialSystemProcess)
+            break;
+    }
+
+    return false;
+}
+
+bool Utils::IsValidDirectoryBase(const ULONG64 directoryBase)
+{
+    //
+    // A directory base that belongs to no live process is an arbitrary page
+    // of RAM the guest filled with PTEs, and walking it turns the copy path
+    // into an arbitrary physical read/write.  Only bases the kernel itself
+    // published in an EPROCESS are accepted.
+    //
+    if (directoryBase == 0 || (directoryBase & 0xFFF) != 0)
+        return false;
+
+    if (Global::Offsets::ActiveProcessLinks == 0 || Global::Offsets::DirectoryTableBase == 0 ||
+        PsInitialSystemProcess == nullptr)
+        return false;
+
+    //
+    // The cache is only an optimization and is only safe while the
+    // process-notify callback is registered (it invalidates entries as
+    // processes come and go).  When the registration failed - the 16-slot
+    // notify table is full on heavily instrumented systems - the cache stays
+    // disabled.  The old code refused every directory base in that case,
+    // which silently disabled the whole copy path (the client's "Failed to
+    // read header").  The process-list walk below is the authoritative
+    // validation, so fall back to it, just without reading or filling the
+    // cache.
+    //
+    const bool cacheUsable = InterlockedCompareExchange(&DirectoryBaseCacheInitialized, 0, 0) != 0;
+
+    if (cacheUsable)
+    {
+        const ULONG64 pageNumber = directoryBase >> PAGE_SHIFT;
+        const ULONG cacheSet = static_cast<ULONG>((pageNumber ^ (pageNumber >> 8) ^ (pageNumber >> 16)) & (DirectoryBaseCacheSetCount - 1));
+        const ULONG cacheSetStart = cacheSet * DirectoryBaseCacheWays;
+
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&DirectoryBaseCacheLock, &oldIrql);
+        for (ULONG way = 0; way < DirectoryBaseCacheWays; way++)
+        {
+            if (DirectoryBaseCache[cacheSetStart + way].DirectoryBase == directoryBase)
+            {
+                KeReleaseSpinLock(&DirectoryBaseCacheLock, oldIrql);
+                return true;
+            }
+        }
+
+        KeReleaseSpinLock(&DirectoryBaseCacheLock, oldIrql);
+    }
+
+    //
+    // Walk only on cache misses. Process notifications invalidate cached
+    // bases, so repeated VMMCALLs do not traverse the process list.
+    //
+    constexpr ULONG maxProcessCount = 0x10000;
+
+    PEPROCESS current = PsInitialSystemProcess;
+    for (ULONG i = 0; i < maxProcessCount; i++)
+    {
+        if (!MmIsAddressValid(current))
+            return false;
+
+        if (Memory::GetDirectoryBase(current) == directoryBase)
+        {
+            if (cacheUsable)
+            {
+                const ULONG64 pageNumber2 = directoryBase >> PAGE_SHIFT;
+                const ULONG cacheSet = static_cast<ULONG>((pageNumber2 ^ (pageNumber2 >> 8) ^ (pageNumber2 >> 16)) & (DirectoryBaseCacheSetCount - 1));
+                const ULONG cacheSetStart = cacheSet * DirectoryBaseCacheWays;
+
+                KIRQL oldIrql;
+                KeAcquireSpinLock(&DirectoryBaseCacheLock, &oldIrql);
+
+                ULONG cacheWay = DirectoryBaseCacheWays;
+                for (ULONG way = 0; way < DirectoryBaseCacheWays; way++)
+                {
+                    if (DirectoryBaseCache[cacheSetStart + way].DirectoryBase == 0)
+                    {
+                        cacheWay = way;
+                        break;
+                    }
+                }
+
+                if (cacheWay == DirectoryBaseCacheWays)
+                {
+                    cacheWay = DirectoryBaseCacheNextWay[cacheSet];
+                    DirectoryBaseCacheNextWay[cacheSet] = (cacheWay + 1) % DirectoryBaseCacheWays;
+                }
+
+                DirectoryBaseCache[cacheSetStart + cacheWay].DirectoryBase = directoryBase;
+                KeReleaseSpinLock(&DirectoryBaseCacheLock, oldIrql);
+            }
+
+            return true;
+        }
+
+        if (!MmIsAddressValid(reinterpret_cast<PBYTE>(current) + Global::Offsets::ActiveProcessLinks))
+            return false;
+
+        current = GetNextProcess(current);
+        if (current == PsInitialSystemProcess)
+            break;
+    }
+
+    return false;
 }
 
 bool Utils::CheckMSR(UINT32 msr)
 {
     //
-    // Ranges resolved at boot from CPUID Fn8000_000A (InitMsrRanges):
-    //   [0x00000000, MsrRange01Max]          - MSR0-1 range, read/write allowed
-    //   [0xC0000000, 0xC0000000 + MsrRange2Max] - MSR2 range (EFER etc.)
-    // Anything else must not be forwarded to the CPU.
+    // Only MSRs that this CPU actually implements may be forwarded.  The
+    // handler reaches the CPU through __readmsr/__writemsr, and both #GP in
+    // *host* mode on an unimplemented MSR - the guest cannot catch that, the
+    // host bugchecks.  The MSR index is guest controlled, so a range check is
+    // not enough: the architectural MSRPM ranges cover thousands of MSRs that
+    // do not exist on this part.
     //
-    // On Zen 2 (Ryzen 7 4800H) CPUID Fn8000_000A EAX resolves to
-    // 0x00021800000000FF, i.e. MsrRange01Max = 0x1FFF and
-    // MsrRange2Max = 0x2FFF - the same effective ranges as the old
-    // hardcoded 0x00001FFF / 0xC0002FFF / 0xC0011FFF checks, but derived
-    // from the CPU itself.
-    if (Global::MsrRange01Max == 0 && Global::MsrRange2Max == 0)
-        return false;
+    // VM_CR (SVMDIS) and VM_HSAVE_PA (host state area) ARE whitelisted so an
+    // intercept does not #GP, but HandleMSRAccess never forwards them to the
+    // CPU: reads return zero (hiding the host state area's physical address
+    // and any SVM state) and writes are ignored.  A guest probing these MSRs
+    // sees exactly what a machine without a hypervisor would show.
+    //
+    static const UINT32 whitelist[] =
+    {
+        0xC0000080, // EFER
+        0xC0000081, // STAR
+        0xC0000082, // LSTAR
+        0xC0000083, // CSTAR
+        0xC0000084, // FMASK
+        0xC0000100, // FS_BASE
+        0xC0000101, // GS_BASE
+        0xC0000102, // KernelGsBase
+        0xC0000103, // TSC_AUX
+        0xC0010114, // VM_CR        (never forwarded - see above)
+        0xC0010117, // VM_HSAVE_PA  (never forwarded - see above)
+    };
 
-    if (msr > 0 && msr <= Global::MsrRange01Max)
-        return true;
-
-    if (msr > 0xC0000000 && (msr - 0xC0000000) <= Global::MsrRange2Max)
-        return true;
+    for (SIZE_T i = 0; i < ARRAYSIZE(whitelist); i++)
+    {
+        if (msr == whitelist[i])
+            return true;
+    }
 
     return false;
 }
 
 void Utils::InitMsrRanges()
 {
-    int registers[4];
-
-    __cpuid(registers, CPUID_SVM_FEATURES);
+    //
+    // The MSR permission map has a fixed, architecture-defined geometry
+    // (AMD APM Vol. 2, "MSR Intercepts"): 8 KB, four 2 KB ranges of 8192
+    // MSRs each, with two bits per MSR (LSB read, MSB write):
+    //
+    //   range 0 - 0x00000000-0x00001FFF  -> map offset 0x0000
+    //   range 1 - 0xC0000000-0xC0001FFF  -> map offset 0x0800
+    //   range 2 - 0xC0010000-0xC0011FFF  -> map offset 0x1000
+    //   range 3 - reserved               -> map offset 0x1800
+    //
+    // CPUID Fn8000_000A does NOT describe these ranges.  A probe on this
+    // machine (Ryzen 7 4800H, Zen 2) returns EAX = 0x00000001 (SVM
+    // revision 1), EBX = 0x00008000 (32768 ASIDs), ECX = 0 and
+    // EDX = 0x0013BCFF (feature bits), which matches the CPUID
+    // specification (EAX[7:0] revision, EBX[31:0] ASID count).  The old
+    // code decoded non-existent EAX[63:52]/[51:32] fields and produced
+    // garbage limits (0xCFF / 0x13 on this machine), which would have made
+    // CheckMSR reject the EFER write intercept.
+    //
+    Global::MsrRange01Max = 0x1FFF; // last MSR of range 0
+    Global::MsrRange2Max = 0x1FFF; // last offset of ranges 1 and 2
 
     //
-    // EAX bit layout (AMD64 APM, section 15.26 "MSR Intercepts"):
-    //   [51:32] - max offset in the 0x00000000-based range (20-bit, max 0x1FFF)
-    //   [63:52] - max offset in the 0xC0000000-based range (12-bit, max 0xFFF)
+    // 0x1800 bytes of the map are architecturally used (range 3 is
+    // reserved), so the allocation must be two pages - one page stops
+    // short of the 0xC0010000 range.
     //
-    const UINT64 eax64 =
-        static_cast<UINT64>(static_cast<UINT32>(registers[0])) |
-        (static_cast<UINT64>(static_cast<UINT32>(registers[3])) << 32);
-
-    Global::MsrRange01Max = static_cast<UINT32>((eax64 >> 32) & 0x1FFF);
-    Global::MsrRange2Max = static_cast<UINT32>((eax64 >> 52) & 0xFFF);
-
-    //
-    // The MSR permission map holds 2 bits per MSR. The second range
-    // (0xC0000000 base) starts at bit 0x800 * CHAR_BIT (AMD APM-defined
-    // MSRPM layout). Size the map to cover exactly what this CPU reports,
-    // page-aligned.
-    //
-    constexpr UINT64 SECOND_MSRPM_OFFSET_BITS = 0x800 * CHAR_BIT;
-    const UINT64 totalBits = SECOND_MSRPM_OFFSET_BITS + (static_cast<UINT64>(Global::MsrRange2Max) + 1) * 2;
-    UINT64 mapSizeBytes = (totalBits + 7) / 8;
-    mapSizeBytes = (mapSizeBytes + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
-
-    Global::MsrPermissionsMapSize = mapSizeBytes ? mapSizeBytes : 2 * PAGE_SIZE;
+    Global::MsrPermissionsMapSize = 2 * PAGE_SIZE;
 }
 
 bool Utils::ValidUsermodeAddress(const ULONG64 address)
@@ -578,12 +1014,21 @@ PVOID Utils::GetPreallocatedPool(SIZE_T size)
     if (size > PreallocatedPoolSize)
         KeBugCheck(BAD_EXHANDLE);
 
-    static SIZE_T currentPoolIndex = 0;
-    if (currentPoolIndex >= ARRAYSIZE(Global::PreallocatedPools))
-        KeBugCheck(BAD_EXHANDLE);
+    //
+    // The index must be interlocked: GetOrSplitPageTable() runs from both the
+    // VMCALL path and the NPF restore path, so two CPUs can split different
+    // large pages at the same instant.  A plain increment would hand both the
+    // same pool, and their two tables would zero and overwrite each other
+    // while the NPT is live.  The split publishes are already atomic 64-bit
+    // exchanges of fully-built, equivalent tables, so racing publishers only
+    // ever waste one pool - never corrupt the tree.
+    //
+    static volatile LONG currentPoolIndex = 0;
+    const LONG index = InterlockedIncrement(&currentPoolIndex) - 1;
+    if (index < 0 || index >= static_cast<LONG>(ARRAYSIZE(Global::PreallocatedPools)))
+        return nullptr;
 
-    const PVOID pool = Global::PreallocatedPools[currentPoolIndex];
-    currentPoolIndex++;
+    const PVOID pool = Global::PreallocatedPools[index];
 
     RtlZeroMemory(pool, size);
 

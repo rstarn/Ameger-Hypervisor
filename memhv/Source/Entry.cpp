@@ -1,4 +1,5 @@
 #include "Global.h"
+#include "HVLog.h"
 
 bool Utils::GetOffsets()
 {
@@ -75,6 +76,19 @@ bool Utils::GetOffsets()
         }
     }
 
+    //
+    // Both fields are mandatory: without DirectoryTableBase every later
+    // read would use offset 0 of the EPROCESS (the first 8 bytes of the
+    // object) as a CR3, and without ActiveProcessLinks the process walk
+    // would follow the wrong list.
+    //
+    if (Global::Offsets::UniqueProcessId == 0 ||
+        Global::Offsets::ActiveProcessLinks == 0 ||
+        Global::Offsets::DirectoryTableBase == 0)
+    {
+        return false;
+    }
+
     return true;
 }
 
@@ -90,8 +104,77 @@ NTSTATUS PreallocatePools()
     return STATUS_SUCCESS;
 }
 
-EXTERN_C NTSTATUS Entry()
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+EXTERN_C NTSTATUS Entry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
+    UNREFERENCED_PARAMETER(RegistryPath);
+
+    //
+    // Start the log flusher (debug builds only; a production build no-ops).
+    //
+    HV::StartLogFlusher();
+
+    HV::Log("Entry: start");
+
+    //
+    // Drain synchronously once, right now.  The file channel is created
+    // write-through, so from this point on the trail is on disk as it
+    // happens - it survives even an instant hard freeze, and a broken file
+    // channel shows up as a missing file immediately instead of only after
+    // the next freeze.  (The flusher thread sleeps before its first drain,
+    // so the two writers do not overlap.)
+    //
+    HV::FlushToFile();
+
+    //
+    // Record the image range this driver is actually resident at.  The loader
+    // and the mapper both pass a DRIVER_OBJECT describing it; the mapper
+    // strips the PE header, so __ImageBase points one page before the
+    // allocation and is only a last-resort fallback for a caller that passes
+    // no object at all.
+    //
+    // The first argument is not always an object: a manual mapper run with
+    // "pass the allocation base" hands the image base over instead.  Reading
+    // DriverStart/DriverSize out of raw image bytes would produce a garbage
+    // range that later looks like a valid one, so the pointer is validated as
+    // a DRIVER_OBJECT before it is trusted.
+    //
+    // Bound the accepted range as well: a caller that hands over an
+    // unrelated object of the right type would otherwise supply an
+    // arbitrarily large DriverSize, and ProtectSelf() would walk it.  The
+    // real loader always reports a kernel VA with SizeOfImage well under
+    // 16 MB, so both checks are free for it and fail closed here.
+    //
+    if (DriverObject != nullptr &&
+        DriverObject->Type == IO_TYPE_DRIVER &&
+        DriverObject->DriverStart != nullptr &&
+        DriverObject->DriverSize != 0 &&
+        DriverObject->DriverSize <= 0x1000000UL &&
+        reinterpret_cast<ULONG64>(DriverObject->DriverStart) >= 0xFFFF800000000000ULL)
+    {
+        Global::DriverBase = reinterpret_cast<ULONG64>(DriverObject->DriverStart);
+        Global::DriverSize = DriverObject->DriverSize;
+    }
+    else
+    {
+        //
+        // Last resort: read the image's own headers.  Only meaningful when
+        // the PE header was not stripped; the size stays zero otherwise, so
+        // GetCurrentDriverInfo() still refuses the range.
+        //
+        Global::DriverBase = reinterpret_cast<ULONG64>(&__ImageBase);
+
+        if (__ImageBase.e_magic == IMAGE_DOS_SIGNATURE)
+        {
+            const PIMAGE_NT_HEADERS64 headers = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+                Global::DriverBase + __ImageBase.e_lfanew);
+
+            if (headers->Signature == IMAGE_NT_SIGNATURE)
+                Global::DriverSize = headers->OptionalHeader.SizeOfImage;
+        }
+    }
+
     //
     // Resolve the EPROCESS layout for this exact kernel build first, so
     // every later consumer (process walk, CR3 resolution) uses dynamic
@@ -102,6 +185,8 @@ EXTERN_C NTSTATUS Entry()
 
     Global::Offsets::Resolved = true;
 
+    HV::Log("Entry: GetOffsets ok");
+
     //
     // Dynamically resolve the Ob* reference/dereference routines and the
     // MmGetPhysicalMemoryRanges export so that no hardcoded kernel offsets
@@ -109,6 +194,17 @@ EXTERN_C NTSTATUS Entry()
     //
     if (!Utils::InitObjectFunctions())
         return STATUS_PROCEDURE_NOT_FOUND;
+
+    HV::Log("Entry: InitObjectFunctions ok");
+
+    //
+    // Cache the machine's RAM ranges while still at PASSIVE_LEVEL, before any
+    // #VMEXIT can run the copy path.  That path validates every physical
+    // address it touches against this cache and must not resolve anything
+    // itself.  A failure is not fatal for the driver: the cache stays
+    // unusable and every physical access is then refused (fail closed).
+    //
+    Utils::InitPhysicalMemoryRanges();
 
     //
     // Read the user/kernel boundary from this kernel's MmHighestUserAddress
@@ -122,25 +218,100 @@ EXTERN_C NTSTATUS Entry()
     //
     Utils::InitMsrRanges();
 
+    HV::Log("Entry: init ranges ok");
+
     if (!Memory::PreparePages())
         return STATUS_INSUFFICIENT_RESOURCES;
+
+    HV::Log("Entry: PreparePages ok");
 
     NTSTATUS status = SVM::CheckSupport();
     if (!NT_SUCCESS(status))
         return status;
 
+    HV::Log("Entry: CheckSupport ok");
+
     status = PreallocatePools();
     if (!NT_SUCCESS(status))
         return status;
+
+    HV::Log("Entry: PreallocatePools ok");
 
     Global::BlankPage = Utils::AllocatePageAligned(PAGE_SIZE);
     if (!Global::BlankPage)
         return STATUS_INSUFFICIENT_RESOURCES;
 
-    HANDLE threadHandle;
-    status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr, SVM::VirtualizeAllProcessors, nullptr);
+    status = Utils::InitializeDirectoryBaseCache();
     if (!NT_SUCCESS(status))
         return status;
 
-    return status;
+    HV::Log("Entry: InitializeDirectoryBaseCache ok");
+
+    //
+    // Arm the readiness event before the thread exists, so the thread can
+    // never signal an uninitialized event and never sees a stale status.
+    //
+    KeInitializeEvent(&Global::VirtualizationReady, NotificationEvent, FALSE);
+    Global::VirtualizationStatus = STATUS_PENDING;
+
+    HANDLE threadHandle;
+    status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr, SVM::VirtualizeAllProcessors, nullptr);
+    if (!NT_SUCCESS(status))
+    {
+        const NTSTATUS shutdownStatus = Utils::ShutdownDirectoryBaseCache();
+        if (!NT_SUCCESS(shutdownStatus))
+            return shutdownStatus;
+        return status;
+    }
+
+    HV::Log("Entry: thread created, waiting for virtualization");
+
+    //
+    // Do not wait on the thread object: once the last CPU has been
+    // virtualized the thread keeps running in guest mode, so its lifetime is
+    // not a usable completion signal.  The event is.  The handle is closed
+    // either way; the thread object itself stays alive until the thread
+    // terminates.
+    //
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -30 * 1000 * 1000 * 10LL; // 30 seconds, relative
+
+    status = KeWaitForSingleObject(&Global::VirtualizationReady, Executive, KernelMode, FALSE, &timeout);
+
+    HV::LogNum("Entry: wait status", status);
+
+    //
+    // The virtualization outcome is the last milestone Entry() logs; make
+    // sure it is on disk before returning into the mapper's flow.
+    //
+    HV::FlushToFile();
+
+    const NTSTATUS virtualizationStatus = Global::VirtualizationStatus;
+
+    ZwClose(threadHandle);
+
+    if (status == STATUS_TIMEOUT)
+    {
+        const NTSTATUS shutdownStatus = Utils::ShutdownDirectoryBaseCache();
+        if (!NT_SUCCESS(shutdownStatus))
+            return shutdownStatus;
+        return STATUS_TIMEOUT;
+    }
+
+    if (!NT_SUCCESS(status))
+    {
+        const NTSTATUS shutdownStatus = Utils::ShutdownDirectoryBaseCache();
+        if (!NT_SUCCESS(shutdownStatus))
+            return shutdownStatus;
+        return status;
+    }
+
+    if (!NT_SUCCESS(virtualizationStatus))
+    {
+        const NTSTATUS shutdownStatus = Utils::ShutdownDirectoryBaseCache();
+        if (!NT_SUCCESS(shutdownStatus))
+            return shutdownStatus;
+    }
+
+    return virtualizationStatus;
 }

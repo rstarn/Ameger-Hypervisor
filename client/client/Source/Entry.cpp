@@ -1,11 +1,13 @@
 #include <Windows.h>
 #include <tlhelp32.h>
 #include <winternl.h>
-#include <iostream>
 #include <chrono>
 #include <mutex>
 
 #include "../Library/memhv.h"
+
+//CommandLineToArgvW lives in shell32.
+#pragma comment(lib, "shell32.lib")
 
 typedef enum _MEMORY_INFORMATION_CLASS
 {
@@ -123,6 +125,16 @@ void ThreadBench(int id)
 
 int main()
 {
+    //
+    // Target process name comes from the command line (wide, so Unicode
+    // names work), defaulting to the historical benchmark target.  This
+    // lets the client be pointed at any running process, e.g.
+    // "client.exe explorer.exe".
+    //
+    int argcW = 0;
+    LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argcW);
+    const wchar_t* targetProcessName = (argvW && argcW > 1) ? argvW[1] : L"SystemInformer.exe";
+
     printf("[>] Checking presence...\n");
     bool status = HV::CheckPresence();
     if (!status)
@@ -141,8 +153,18 @@ int main()
         return EXIT_FAILURE;
     }
 
-    printf("[>] Searching for target process...\n");
-    UINT32 targetProcessId = LookupProcessId(L"SystemInformer.exe");
+    //
+    // ProtectSelf() only sets TlbControl on each published VMCB; a vCPU that
+    // was already inside VMRUN at that moment flushes at its next exit.  Pin
+    // the thread to every processor in turn and issue one no-op VMMCALL so
+    // each of them takes that exit now.
+    //
+    printf("[>] Flushing NPT on all processors...\n");
+    if (!HV::FlushAllProcessors())
+        printf("[!] Not every processor confirmed the NPT flush\n");
+
+    printf("[>] Searching for target process (%ls)...\n", targetProcessName);
+    UINT32 targetProcessId = LookupProcessId(targetProcessName);
     if (!targetProcessId)
     {
         printf("[!] Process not found\n");
@@ -165,7 +187,7 @@ int main()
     printf("[+] Target process: EPROCESS -> 0x%llx CR3 -> 0x%llx\n", HV::Data::TargetEPROCESS, HV::Data::TargetDirectoryBase);
 
     printf("[>] Getting module base address...\n");
-    MainModule = GetModule(targetProcessId, L"SystemInformer.exe");
+    MainModule = GetModule(targetProcessId, targetProcessName);
     if (!MainModule)
     {
         printf("[!] Failed to get module base address\n");

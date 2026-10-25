@@ -27,6 +27,8 @@ namespace HV
             GetDirectoryBase,
             CopyProcessMemory,
             ProtectSelf,
+            FlushNpt,
+            ProtectRange,
         };
 
         enum ErrorCodes
@@ -36,6 +38,7 @@ namespace HV
             MemoryCopyTooLarge,
             MemoryCopyFailSource,
             MemoryCopyFailTarget,
+            InvalidProcess,
         };
 
         typedef struct _COPY_MEMORY_DATA
@@ -77,7 +80,7 @@ namespace HV
         }
 
         typedef ULONG64(__stdcall* CallFunc)(ULONG64 arg1, ULONG64 arg2, ULONG64 arg3, ULONG64 arg4);
-        const CallFunc func = static_cast<CallFunc>(Data::Shellcode);
+        const CallFunc func = reinterpret_cast<CallFunc>(Data::Shellcode);
 
         ULONG64 output;
         __try
@@ -107,6 +110,20 @@ namespace HV
         return false;
     }
 
+    //
+    // Blanks an arbitrary guest virtual range [base, base + size) in the NPT,
+    // redirecting each page to the shared blank page - the same primitive
+    // ProtectSelf() uses on the hypervisor's own image.  Pass the kernel
+    // virtual base the mapper allocated (its DriverObject DriverStart) and
+    // the allocation size (DriverSize).  Call it after every driver you want
+    // hidden has run DriverEntry, and run FlushAllProcessors() once afterwards.
+    //
+    inline bool HideMemory(ULONG64 base, SIZE_T size)
+    {
+        const ULONG64 output = CallVM(Shared::MAGIC, Shared::CommandId::ProtectRange, base, static_cast<ULONG64>(size));
+        return output == Shared::ErrorCodes::Success;
+    }
+
     inline bool CheckPresence()
     {
         const ULONG64 output = CallVM(Shared::MAGIC, Shared::CommandId::CheckPresence);
@@ -117,6 +134,61 @@ namespace HV
     {
         const ULONG64 output = CallVM(Shared::MAGIC, Shared::CommandId::ProtectSelf);
         return output == Shared::ErrorCodes::Success;
+    }
+
+    /*
+     * Forces every active processor through one #VMEXIT.
+     *
+     * ProtectSelf() bumps the shared NPT flush generation and sets TlbControl
+     * on every published VMCB, but a vCPU that is already inside VMRUN when
+     * that store lands never sees it and would only flush at its next exit.
+     * Issuing FlushNpt from each CPU pins the current thread to that CPU, so
+     * the VMMCALL itself is the exit that arms the flush.
+     *
+     * Single-threaded on purpose: the shellcode in Data::Shellcode is global
+     * state, and a pinned sweep covers every CPU without racing on it.
+     */
+    inline bool FlushAllProcessors()
+    {
+        const DWORD processorCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        if (processorCount == 0)
+            return false;
+
+        const HANDLE thread = GetCurrentThread();
+
+        GROUP_AFFINITY original = { 0 };
+        if (!GetThreadGroupAffinity(thread, &original))
+            return false;
+
+        bool allFlushed = true;
+        for (DWORD index = 0; index < processorCount; index++)
+        {
+            GROUP_AFFINITY affinity = { 0 };
+            affinity.Group = static_cast<WORD>(index / 64);
+            affinity.Mask = 1ULL << (index % 64);
+
+            GROUP_AFFINITY previous = { 0 };
+            if (!SetThreadGroupAffinity(thread, &affinity, &previous))
+            {
+                printf("[*] flush CPU %d: pin failed\n", index);
+                allFlushed = false;
+                continue;
+            }
+
+            if (CallVM(Shared::MAGIC, Shared::CommandId::FlushNpt) != Shared::ErrorCodes::Success)
+            {
+                printf("[*] flush CPU %d: vmmcall failed\n", index);
+                allFlushed = false;
+            }
+            else
+            {
+                printf("[*] flush CPU %d: ok\n", index);
+            }
+        }
+
+        SetThreadGroupAffinity(thread, &original, nullptr);
+
+        return allFlushed;
     }
 
     inline ULONG64 GetEPROCESS(UINT32 processId)
@@ -157,15 +229,38 @@ namespace HV
 
     inline bool CopyProcessMemory(ULONG64 sourceDirbase, ULONG64 sourceAddress, ULONG64 targetDirbase, ULONG64 targetAddress, SIZE_T bytes)
     {
-        Shared::COPY_MEMORY_DATA data = { 0 };
-        data.SourceDirectoryBase = sourceDirbase;
-        data.SourceAddress = sourceAddress;
-        data.DestinationDirectoryBase = targetDirbase;
-        data.DestinationAddress = targetAddress;
-        data.NumberOfBytes = bytes;
+        //
+        // The protocol caps one VMMCALL at Shared::MAX_RW_SIZE (the kernel
+        // stages the transfer in a fixed buffer), so larger requests are
+        // split here into consecutive calls.  Every chunk is validated
+        // end-to-end by the driver like a standalone copy, so a chunk that
+        // fails aborts the remainder and reports failure for the request.
+        //
+        ULONG64 source = sourceAddress;
+        ULONG64 target = targetAddress;
+        SIZE_T remaining = bytes;
 
-        const ULONG64 value = CallVM(Shared::MAGIC, Shared::CommandId::CopyProcessMemory, reinterpret_cast<ULONG64>(&data), Data::CurrentDirectoryBase);
-        return value == Shared::ErrorCodes::Success;
+        while (remaining)
+        {
+            const ULONG64 chunk = (remaining > Shared::MAX_RW_SIZE) ? static_cast<ULONG64>(Shared::MAX_RW_SIZE) : remaining;
+
+            Shared::COPY_MEMORY_DATA data = { 0 };
+            data.SourceDirectoryBase = sourceDirbase;
+            data.SourceAddress = source;
+            data.DestinationDirectoryBase = targetDirbase;
+            data.DestinationAddress = target;
+            data.NumberOfBytes = chunk;
+
+            const ULONG64 value = CallVM(Shared::MAGIC, Shared::CommandId::CopyProcessMemory, reinterpret_cast<ULONG64>(&data), Data::CurrentDirectoryBase);
+            if (value != Shared::ErrorCodes::Success)
+                return false;
+
+            source += chunk;
+            target += chunk;
+            remaining -= static_cast<SIZE_T>(chunk);
+        }
+
+        return true;
     }
 
     inline bool ReadMemory(ULONG64 source, ULONG64 buffer, SIZE_T size)
@@ -174,6 +269,15 @@ namespace HV
         return CopyProcessMemory(Data::TargetDirectoryBase, source, Data::CurrentDirectoryBase, buffer, size);
     }
 
+    /*
+     * The copy path resolves through physical page tables, so both the
+     * source and the destination of every read/write must be RESIDENT
+     * (present PTEs at every level).  Non-resident chunks (paged out, or
+     * committed but never touched - demand zero) are skipped by the driver:
+     * the request still succeeds, the skipped bytes are simply not
+     * transferred.  Live memory of a running process is always resident;
+     * only freshly allocated, never-touched remote buffers are not.
+     */
     inline bool WriteMemory(ULONG64 buffer, ULONG64 destination, SIZE_T size)
     {
         return CopyProcessMemory(Data::CurrentDirectoryBase, buffer, Data::TargetDirectoryBase, destination, size);

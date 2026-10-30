@@ -140,7 +140,29 @@ namespace SVM
         // points at; non-null means the whole tree was built.
         //
         PD_ENTRY_2MB** PdPages;
+
+        //
+        // On-demand NPT coverage for the 2 MB fallback.  BuildNestedPageTables()
+        // maps 1:1 only up to ComputeMappedGpaEnd() (RAM end, 1 TB floor), so a
+        // device BAR above that window raises a #NPF with no leaf to restore.
+        // SparePdPages[] holds a small, boot-time pool of PD pages; the #NPF
+        // handler consumes one to map the whole 1 GB region containing such a
+        // GPA (one PD page = 512 2 MB entries).  This is what keeps an
+        // out-of-window fault from re-faulting forever: either the region gets
+        // mapped, or the pool is empty and the unresolved-fault tripwire
+        // fires.  The array sits in the page-aligned tail padding, so it
+        // changes no offset above and does not grow the allocation.
+        //
+        PD_ENTRY_2MB* SparePdPages[NPT_SPARE_PD_COUNT];
+        volatile LONG SparePdCursor;
     } SHARED_VIRTUAL_PROCESSOR_DATA, * PSHARED_VIRTUAL_PROCESSOR_DATA;
+    //
+    // Pml4Entries and PdpEntries are page-aligned members, so the struct spans
+    // exactly three pages and everything after them lives in the tail padding.
+    // Growing the tail past the third page silently increases the allocation;
+    // keep the layout pinned so a new field is a compile-time decision.
+    //
+    static_assert(sizeof(SHARED_VIRTUAL_PROCESSOR_DATA) == PAGE_SIZE * 3, "SHARED_VIRTUAL_PROCESSOR_DATA size mismatch");
 
     typedef struct _VIRTUAL_PROCESSOR_DATA
     {

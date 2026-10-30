@@ -1,0 +1,60 @@
+# clangd configuration for the Mapper kernel-mode driver.
+#
+# Mirrors the real MSBuild/WDK build (Mapper.vcxproj, Release|x64) so that
+# clangd parses the sources with the same preprocessor state as cl.exe.
+# Toolchain on this machine:
+#   WDK  10.0.28000.0
+#   MSVC 19.51.36260 (14.51.36231), VS 18 BuildTools
+#
+# Everything is passed as CompileFlags.Add so the MSBuild project itself is
+# left untouched.
+
+CompileFlags:
+  Add:
+    # MSVC-compatible driver/target
+    - "--target=x86_64-pc-windows-msvc"
+    - "-fms-extensions"
+    - "-fms-compatibility"
+    - "-fms-compatibility-version=19.51.36260"
+    - "-fdelayed-template-parsing"
+    - "-std=c++20"
+
+    # Preprocessor definitions, copied from the Release|x64 CL command line
+    - "-D_KERNEL_MODE=1"
+    - "-D_WIN64"
+    - "-D_AMD64_"
+    - "-DAMD64"
+    - "-D_WIN32_WINNT=0x0A00"
+    - "-DWINVER=0x0A00"
+    - "-DWINNT=1"
+    - "-DNTDDI_VERSION=0xA000012"
+    - "-DKMDF_VERSION_MAJOR=1"
+    - "-DKMDF_VERSION_MINOR=15"
+
+    # WDK headers: km first, then the kernel CRT, then shared. Marked as
+    # system headers (same effect MSVC gives them) so their own clang-only
+    # warnings do not show up in the editor.
+    # Joined form (-isystem<dir>) so every array item is unique; YAML linters
+    # flag repeated scalars such as a bare "-isystem" as duplicate items.
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.28000.0/km"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.28000.0/km/crt"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.28000.0/shared"
+    - "-isystemC:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/MSVC/14.51.36231/include"
+    - "-isystemC:/Program Files (x86)/Windows Kits/10/Include/10.0.28000.0/ucrt"
+
+    # Preinclude the guarded WDK kernel header so a project header opened on
+    # its own (clangd has no TU context for headers) still sees the NT types.
+    # ntifs.h is never the main file, so this cannot double-process it.
+    - "-include"
+    - "ntifs.h"
+
+    # WDK headers trip a few clang-only warnings that MSVC never emits
+    - "-Wno-unknown-attributes"
+    - "-Wno-microsoft-enum-forward-reference"
+    - "-Wno-ignored-pragma-intrinsic"
+    - "-Wno-pragma-pack"
+    - "-Wno-delayed-template-parsing-in-cxx20"
+
+    # The project builds with /wd4996 (Release|x64); keep clangd in sync
+    # instead of flagging ExAllocatePool as deprecated.
+    - "-Wno-deprecated-declarations"

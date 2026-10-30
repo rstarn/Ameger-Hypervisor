@@ -92,6 +92,7 @@
     <ClCompile Include="..\..\..\Hypervisor\Source\SVM\Handlers\MSRAccess.cpp" />
     <ClCompile Include="..\..\..\Hypervisor\Source\SVM\Handlers\Exit\VMCall.cpp" />
     <ClCompile Include="..\..\..\Hypervisor\Source\SVM\SVM.cpp" />
+    <ClCompile Include="..\..\..\Hypervisor\Source\SVM\Stealth.cpp" />
     <ClCompile Include="..\..\..\Hypervisor\Utilities\Utilities.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -105,6 +106,7 @@
     <ClInclude Include="..\..\..\Hypervisor\Source\SVM\Defines\ProcessorData.h" />
     <ClInclude Include="..\..\..\Hypervisor\Source\SVM\Handlers\Exit\VMExit.h" />
     <ClInclude Include="..\..\..\Hypervisor\Source\SVM\SVM.h" />
+    <ClInclude Include="..\..\..\Hypervisor\Source\SVM\Stealth.h" />
     <ClInclude Include="..\..\..\Hypervisor\Utilities\Utilities.h" />
   </ItemGroup>
   <ItemGroup>

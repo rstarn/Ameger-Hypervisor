@@ -1,4 +1,10 @@
 @echo off
+rem Resolve the repository root FIRST, before the :scan_args loop runs. That loop
+rem calls `shift`, which corrupts %~dp0 (it then resolves to just the drive
+rem letter, making ROOT point at the drive root and failing the source check). This script lives in
+rem Build\Executors\, so the repo root is two levels up. Do not use "%~dp0.."
+rem (one level up resolves to Build\ itself).
+for %%I in ("%~dp0..\..") do set "ROOT=%%~fI"
 rem Create.bat - one-shot release builder for the Hypervisor and Client.
 rem What: cleans the release and scratch trees, resolves MSBuild, builds both
 rem   solutions in Release|x64, stages Hypervisor.sys and Client.exe under
@@ -19,13 +25,21 @@ rem   AMEGER_WINDOWS_SDK_VERSION     override the Windows SDK version
 rem   AMEGER_KEEP_PDB=1              ship the .pdb next to the binaries
 rem
 rem Command line:
-rem   Create.bat [/nopause]
+rem   Create.bat [/nopause] [/no-mapper]
 setlocal EnableExtensions DisableDelayedExpansion
 
 set "NO_PAUSE=0"
+set "NO_MAPPER=0"
 if defined CREATE_NO_PAUSE set "NO_PAUSE=%CREATE_NO_PAUSE%"
 if defined AMEGER_NO_PAUSE set "NO_PAUSE=%AMEGER_NO_PAUSE%"
+rem Scan every command-line argument for the /nopause and /no-mapper flags.
+:scan_args
+if "%~1"=="" goto :args_done
 if /i "%~1"=="/nopause" set "NO_PAUSE=1"
+if /i "%~1"=="/no-mapper" set "NO_MAPPER=1"
+shift
+goto :scan_args
+:args_done
 
 set "C_RESET="
 set "C_GREEN="
@@ -39,9 +53,6 @@ if defined ESC (
     set "C_YELLOW=%ESC%[93m"
 )
 
-rem This script lives in Build\Executors\, so the repository root is two levels
-rem up. Do not root at "%~dp0..": that resolves to Build\ itself.
-for %%I in ("%~dp0..\..") do set "ROOT=%%~fI"
 set "BUILD_DIR=%ROOT%\Build"
 set "OUT_ROOT=%BUILD_DIR%\Release"
 set "SCRATCH=%TEMP%\hypervisor_build"
@@ -51,6 +62,8 @@ set "HV_SLN=%BUILD_DIR%\Template\Hypervisor\Hypervisor.sln"
 set "CLIENT_SLN=%BUILD_DIR%\Template\Client\Client.sln"
 set "HV_PROJ=%BUILD_DIR%\Template\Hypervisor\Hypervisor.vcxproj"
 set "CLIENT_PROJ=%BUILD_DIR%\Template\Client\Client.vcxproj"
+set "MAPPER_SLN=%BUILD_DIR%\Template\Mapper\Mapper.sln"
+set "MAPPER_PROJ=%BUILD_DIR%\Template\Mapper\Mapper.vcxproj"
 set "HV_ASM=%ROOT%\Hypervisor\Utilities\x64.asm"
 set "CLIENT_HEADER=%ROOT%\Client\Library\Hypervisor.h"
 set "PLATFORM_HEADER=%ROOT%\Hypervisor\Source\Memory\Definitions.h"
@@ -85,6 +98,10 @@ if not exist "%CLIENT_PROJ%" goto :source_error
 if not exist "%HV_ASM%" goto :source_error
 if not exist "%CLIENT_HEADER%" goto :source_error
 if not exist "%PLATFORM_HEADER%" goto :source_error
+if "%NO_MAPPER%"=="0" (
+  if not exist "%MAPPER_SLN%" goto :source_error
+  if not exist "%MAPPER_PROJ%" goto :source_error
+)
 echo   %C_GREEN%[+]%C_RESET% Solutions, projects, MASM source, shared ABI header and platform header present.
 echo.
 echo.
@@ -111,12 +128,16 @@ echo   %C_GREEN%[+]%C_RESET% Clean layout prepared in: %C_GREEN%%OUT_ROOT%%C_RES
 echo.
 echo.
 
-echo [%C_GREEN%4%C_RESET%/%C_GREEN%5%C_RESET%] Building Hypervisor and Client...
+echo [%C_GREEN%4%C_RESET%/%C_GREEN%5%C_RESET%] Building Hypervisor, Mapper and Client...
 echo.
 call :build_solution "%HV_SLN%" "hypervisor"
 if errorlevel 1 goto :build_error
 call :build_solution "%CLIENT_SLN%" "client"
 if errorlevel 1 goto :build_error
+if "%NO_MAPPER%"=="0" (
+  call :build_solution "%MAPPER_SLN%" "mapper"
+  if errorlevel 1 goto :build_error
+)
 echo.
 echo   %C_GREEN%[+]%C_RESET% Native output: %C_GREEN%%NATIVE_OUT%%C_RESET%
 echo.
@@ -139,6 +160,7 @@ echo Build completed successfully.
 echo.
 echo Driver: %C_GREEN%%OUT_ROOT%\Hypervisor.sys%C_RESET%
 echo Client: %C_GREEN%%OUT_ROOT%\Client.exe%C_RESET%
+if "%NO_MAPPER%"=="0" echo Mapper: %C_GREEN%%OUT_ROOT%\Mapper.sys%C_RESET%
 echo.
 
 if "%NO_PAUSE%"=="0" pause
@@ -166,6 +188,10 @@ call :stage "%NATIVE_OUT%\Hypervisor.sys" "%OUT_ROOT%\Hypervisor.sys"
 if errorlevel 1 exit /b 1
 call :stage "%NATIVE_OUT%\Client.exe" "%OUT_ROOT%\Client.exe"
 if errorlevel 1 exit /b 1
+if "%NO_MAPPER%"=="0" (
+  call :stage "%NATIVE_OUT%\Mapper.sys" "%OUT_ROOT%\Mapper.sys"
+  if errorlevel 1 exit /b 1
+)
 exit /b 0
 
 :stage
@@ -209,6 +235,10 @@ call :verify_pe "%OUT_ROOT%\Hypervisor.sys" "Hypervisor.sys"
 if errorlevel 1 exit /b 1
 call :verify_pe "%OUT_ROOT%\Client.exe" "Client.exe"
 if errorlevel 1 exit /b 1
+if "%NO_MAPPER%"=="0" (
+  call :verify_pe "%OUT_ROOT%\Mapper.sys" "Mapper.sys"
+  if errorlevel 1 exit /b 1
+)
 exit /b 0
 
 :verify_pe

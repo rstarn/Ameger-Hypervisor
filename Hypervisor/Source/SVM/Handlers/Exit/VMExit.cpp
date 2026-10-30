@@ -1,5 +1,6 @@
 #include "../../../Core/Global.h"
 #include "../../../Common/HVLogs.h"
+#include "../../../SVM/Stealth.h"
 
 void SVM::InjectGeneralProtectionException(const PVIRTUAL_PROCESSOR_DATA vpData)
 {
@@ -118,7 +119,7 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
     // it after this point.
     //
     vpData->GuestVmcb.ControlArea.TlbControl = 0;
-    SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
+    SVM::MarkVmcbDirty(vpData->GuestVmcb.ControlArea);
 
     if (sharedData && exitCode != VMEXIT_NPF)
     {
@@ -138,7 +139,7 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
             sharedData->NptFlushSeen[processorIndex] = sharedData->NptFlushGeneration;
 
             InterlockedExchange(reinterpret_cast<volatile LONG*>(&vpData->GuestVmcb.ControlArea.TlbControl), 1);
-            SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
+            SVM::MarkVmcbDirty(vpData->GuestVmcb.ControlArea);
         }
     }
 
@@ -195,6 +196,10 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
     switch (vpData->GuestVmcb.ControlArea.ExitCode)
     {
     case VMEXIT_MSR:
+#if HYPERVISOR_STEALTH
+        if (Stealth::HandleMsrAccess(vpData, &guestContext))
+            break;
+#endif
         HandleMSRAccess(vpData, &guestContext);
         break;
     case VMEXIT_VMRUN:
@@ -206,6 +211,10 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
         HandleGenericSVM(vpData, &guestContext);
         break;
     case VMEXIT_CPUID:
+#if HYPERVISOR_STEALTH
+        if (Stealth::HandleCpuidSpoof(vpData, &guestContext))
+            break;
+#endif
         HandleCPUID(vpData, &guestContext);
         break;
     case VMEXIT_VMMCALL:
@@ -216,22 +225,18 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
         // BuildNestedPageTables maps guest-physical space 1:1 with full
         // permissions (P=W=S=1, NX=0): the whole 48-bit space when the CPU
         // has 1 GB nested pages, or the RAM range plus a 1 TB floor when the
-        // 2 MB fallback is in use (see ComputeMappedGpaEnd).  Within that
-        // range the only nested page faults possible on this VMCB are the
-        // pages HideRange() made not-present.  Resolve them transparently:
-        // re-set Present, flush this CPU's TLB at the next VMRUN, and resume
-        // the faulting instruction.  No event is injected and NRip is left
-        // as-is, so the CPU re-executes the access against the restored page
-        // and the guest never observes a fault.
+        // 2 MB fallback is in use (see ComputeMappedGpaEnd).  Two things can
+        // fault inside that window: a page HideRange() made not-present, and
+        // a GPA above the boot-time window (a device BAR).  Both are resolved
+        // here without injecting anything: restore or map, flush this CPU's
+        // TLB at the next VMRUN, and resume the faulting instruction.  NRip is
+        // left as-is, so the CPU re-executes the access against the restored
+        // page and the guest never observes a fault.
         //
         // The lookup runs with allowSplit == false: the diagnostic path must
         // never allocate a split table.  Doing so used to burn the fixed
         // preallocated pool on unrelated faults until genuine hidden pages
         // could no longer be reached at all.
-        //
-        // A fault outside the mapped range - an MMIO BAR above the 2 MB
-        // fallback's ceiling - has no entry to restore; it falls through to
-        // the unresolvable path below.
         //
         // NOTHING is ever injected from this path.  Injecting #PF from a
         // #NPF is the one mechanism this driver has that reliably
@@ -248,6 +253,47 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
             Hypervisor::LogNum("HandleExit: NPF gpa", gpa);
 
             PT_ENTRY_4KB* entry = sharedData ? SVM::GetPageTableEntry(sharedData, gpa, false) : nullptr;
+
+            //
+            // A GPA above the boot-time window has no PDPTE at all, so there
+            // is no leaf to inspect.  Map the whole 1 GB region from the
+            // spare PD pool and resume: the region is now covered by 2 MB
+            // large pages, which is exactly what the boot-time tree uses.
+            // If the pool cannot supply a page, fall through to the
+            // unresolved-fault tripwire rather than re-faulting silently.
+            //
+            if (!entry && sharedData)
+            {
+                const SVM::GpaMapResult mapResult = SVM::MapGpaOnDemand(sharedData, gpa);
+
+                if (mapResult != SVM::GpaMapResult::CannotMap)
+                {
+                    if (mapResult == SVM::GpaMapResult::MappedNow)
+                    {
+                        InterlockedExchange(&sharedData->NpfUnresolvedRun[slot], 0);
+                        InterlockedExchange(&sharedData->NpfStaleStrikes[slot], 0);
+                        Hypervisor::Log("NPF: region mapped on demand");
+                    }
+                    else if (InterlockedIncrement(&sharedData->NpfUnresolvedRun[slot]) > NPF_UNRESOLVED_LIMIT)
+                    {
+                        //
+                        // The region is present in the NPT and the TLB is
+                        // flushed on every one of these faults, yet the same
+                        // access keeps faulting: there is nothing left to fix.
+                        //
+                        KeBugCheckEx(INVALID_DRIVER_HANDLE,
+                            static_cast<ULONG64>('NPF2'),
+                            gpa,
+                            vpData->GuestVmcb.StateSaveArea.Rip,
+                            vpData->GuestVmcb.ControlArea.ExitInfo1);
+                    }
+
+                    vpData->GuestVmcb.ControlArea.EventInj = 0;
+                    InterlockedExchange(reinterpret_cast<volatile LONG*>(&vpData->GuestVmcb.ControlArea.TlbControl), 1);
+                    SVM::MarkVmcbDirty(vpData->GuestVmcb.ControlArea);
+                    return;
+                }
+            }
 
             if (entry)
             {
@@ -300,24 +346,23 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
                 //
                 vpData->GuestVmcb.ControlArea.EventInj = 0;
                 InterlockedExchange(reinterpret_cast<volatile LONG*>(&vpData->GuestVmcb.ControlArea.TlbControl), 1);
-                SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
+                SVM::MarkVmcbDirty(vpData->GuestVmcb.ControlArea);
 
                 return;
             }
 
             //
-            // No entry for this GPA: either the address is outside the mapped
-            // range (MMIO) or the pool could not supply a split table.  Both
-            // mean the hide is no longer defensible - restore everything and
-            // stop re-hiding, then resume without injection.  A genuinely
-            // stuck RIP still accumulates in NpfUnresolvedRun and the
-            // tripwire below turns it into a diagnosable bugcheck instead of
-            // a silent freeze.
+            // No entry and no region to map: either the spare PD pool is
+            // exhausted or the GPA is outside the 48-bit space.  The hide is
+            // no longer defensible - restore everything and stop re-hiding,
+            // then resume without injection.  A genuinely stuck RIP keeps
+            // accumulating in NpfUnresolvedRun and the tripwire below turns
+            // it into a diagnosable bugcheck instead of a silent freeze.
             //
             SVM::DisableSelfHide(sharedData);
 
             if (sharedData &&
-                InterlockedIncrement(&sharedData->NpfUnresolvedRun[slot]) > 1000)
+                InterlockedIncrement(&sharedData->NpfUnresolvedRun[slot]) > NPF_UNRESOLVED_LIMIT)
             {
                 Hypervisor::Log("HandleExit: NPF stuck, bugcheck");
 
@@ -331,7 +376,7 @@ EXTERN_C void SVM::HandleExit(PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_REGIS
             Hypervisor::Log("HandleExit: NPF unresolvable, resuming");
 
             vpData->GuestVmcb.ControlArea.TlbControl = 1;
-            SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
+            SVM::MarkVmcbDirty(vpData->GuestVmcb.ControlArea);
         }
         break;
     case VMEXIT_SHUTDOWN:

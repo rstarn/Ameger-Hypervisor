@@ -19,6 +19,7 @@ namespace Shared
         ProtectSelf,
         FlushNpt,
         ProtectRange,
+        GetDriverInfo,
     };
 
     enum ErrorCodes
@@ -46,4 +47,22 @@ namespace Shared
     static_assert(offsetof(COPY_MEMORY_DATA, SourceAddress) == 0x08, "COPY_MEMORY_DATA.SourceAddress ABI mismatch");
     static_assert(offsetof(COPY_MEMORY_DATA, DestinationAddress) == 0x10, "COPY_MEMORY_DATA.DestinationAddress ABI mismatch");
     static_assert(offsetof(COPY_MEMORY_DATA, NumberOfBytes) == 0x18, "COPY_MEMORY_DATA.NumberOfBytes ABI mismatch");
+
+    //
+    // GetDriverInfo (command 0x08): returns the driver's image base/size and its
+    // resolved .text section range.  Written to the caller's user buffer (R8).
+    //
+    typedef struct _DRIVER_INFO
+    {
+        ULONG64 DriverBase;    // 0x00
+        SIZE_T  DriverSize;    // 0x08
+        ULONG64 TextBase;      // 0x10
+        SIZE_T  TextSize;      // 0x18
+    } DRIVER_INFO;
+
+    static_assert(sizeof(DRIVER_INFO) == 32, "DRIVER_INFO ABI mismatch");
+    static_assert(offsetof(DRIVER_INFO, DriverBase) == 0x00, "DRIVER_INFO.DriverBase ABI mismatch");
+    static_assert(offsetof(DRIVER_INFO, DriverSize) == 0x08, "DRIVER_INFO.DriverSize ABI mismatch");
+    static_assert(offsetof(DRIVER_INFO, TextBase) == 0x10, "DRIVER_INFO.TextBase ABI mismatch");
+    static_assert(offsetof(DRIVER_INFO, TextSize) == 0x18, "DRIVER_INFO.TextSize ABI mismatch");
 }

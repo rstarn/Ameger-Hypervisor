@@ -166,15 +166,22 @@ namespace SVM
     static_assert(offsetof(VMCB, StateSaveArea) == 0x400, "VMCB state save area offset mismatch");
 
     //
-    // Tell the CPU to reload the first 256 bytes of the VMCB control area
-    // (offsets 0x000-0x0FF, VMCB_Clean bit 0) at the next VMRUN.  That region
-    // holds TlbControl and EventInj: if a VMEXIT handler writes TlbControl=1
-    // without invalidating this clean bit, the VMRUN ignores it, the NPT TLB
-    // is never flushed, and a restored page keeps faulting forever - the CPU
-    // livelocks between VMRUN and the nested page fault.
+    // Tell the CPU to reload the VMCB from memory at the next VMRUN by
+    // clearing every VMCB_CLEAN bit.
     //
-    inline void MarkControlAreaDirty(VMCB_CONTROL_AREA& controlArea)
+    // The processor is allowed to cache parts of the VMCB between VMRUNs and
+    // to reload only the groups whose clean bit software cleared (AMD APM
+    // vol. 2, "VMCB Clean Bits" - separate bits cover the intercept vectors,
+    // IOPM/MSRPM, TSC offset, ASID, TPR, NPT controls, CRx, DRx, segment
+    // state, CR2, ...).  The exit handlers here modify both control-area
+    // fields (TlbControl, EventInj, NCr3) and state-save fields (Rip, Rax,
+    // Efer), so clearing only bit 0 would leave an emulated instruction's new
+    // RIP/Rax invisible to VMRUN on an implementation that caches the state
+    // save area.  Clearing the whole field is architecturally always valid,
+    // and a full reload is irrelevant next to that correctness requirement.
+    //
+    inline void MarkVmcbDirty(VMCB_CONTROL_AREA& controlArea)
     {
-        controlArea.VmcbClean &= ~1ULL;
+        controlArea.VmcbClean = 0;
     }
 }

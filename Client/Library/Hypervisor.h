@@ -7,9 +7,135 @@
 
 #include <intrin.h>
 #include <Windows.h>
+#include <cstdarg>
 #include <cstddef>
+#include <cstdio>
 #include <iostream>
 #include <stdint.h>
+
+/*
+ * Result-line console output.
+ *
+ * Every line has the shape
+ *
+ *     [ + ] CheckPresence        : 0xdead
+ *
+ * i.e. a bracketed marker, the PascalCase label padded to a fixed width, a
+ * separator and the value.  Values are coloured by outcome (green = ok,
+ * red = failure, yellow = inconclusive/info, cyan = step/section marker).
+ *
+ * Colour uses VT sequences and is enabled only when stdout is a real console
+ * that accepted ENABLE_VIRTUAL_TERMINAL_PROCESSING.  When the output is
+ * redirected, or the console refuses VT, Init() leaves colour off and the
+ * helpers emit the same text without any escape bytes.
+ */
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+
+namespace Console
+{
+    inline bool& ColorEnabled()
+    {
+        static bool enabled = false;
+        return enabled;
+    }
+
+    inline void Init()
+    {
+        ColorEnabled() = false;
+
+        const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (!output || output == INVALID_HANDLE_VALUE)
+            return;
+
+        DWORD mode = 0;
+        if (!GetConsoleMode(output, &mode))
+            return; // redirected: no console, so no colour
+
+        if (!SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+            return; // console rejected VT: stay plain
+
+        ColorEnabled() = true;
+    }
+
+    enum class Tone
+    {
+        Ok,
+        Fail,
+        Info,
+        Step,
+    };
+
+    inline const char* Marker(Tone tone)
+    {
+        switch (tone)
+        {
+        case Tone::Ok:   return "+";
+        case Tone::Fail: return "!";
+        case Tone::Info: return "*";
+        default:         return ">";
+        }
+    }
+
+    inline const char* Color(Tone tone)
+    {
+        switch (tone)
+        {
+        case Tone::Ok:   return "\x1b[92m"; // bright green
+        case Tone::Fail: return "\x1b[91m"; // bright red
+        case Tone::Info: return "\x1b[93m"; // bright yellow
+        default:         return "\x1b[96m"; // bright cyan
+        }
+    }
+
+    inline void Emit(Tone tone, const char* label, const char* format, va_list args)
+    {
+        char value[512];
+        vsnprintf(value, sizeof(value), format, args);
+
+        if (!ColorEnabled())
+        {
+            printf("[ %s ] %-24s : %s\n", Marker(tone), label, value);
+            return;
+        }
+
+        const char* color = Color(tone);
+        printf("%s[ %s ]\x1b[0m %-24s : %s%s\x1b[0m\n", color, Marker(tone), label, color, value);
+    }
+
+    inline void Ok(const char* label, const char* format, ...)
+    {
+        va_list args;
+        va_start(args, format);
+        Emit(Tone::Ok, label, format, args);
+        va_end(args);
+    }
+
+    inline void Fail(const char* label, const char* format, ...)
+    {
+        va_list args;
+        va_start(args, format);
+        Emit(Tone::Fail, label, format, args);
+        va_end(args);
+    }
+
+    inline void Info(const char* label, const char* format, ...)
+    {
+        va_list args;
+        va_start(args, format);
+        Emit(Tone::Info, label, format, args);
+        va_end(args);
+    }
+
+    inline void Step(const char* label, const char* format, ...)
+    {
+        va_list args;
+        va_start(args, format);
+        Emit(Tone::Step, label, format, args);
+        va_end(args);
+    }
+}
 
 namespace Hypervisor
 {
@@ -30,6 +156,7 @@ namespace Hypervisor
             ProtectSelf,
             FlushNpt,
             ProtectRange,
+            GetDriverInfo,
         };
 
         enum ErrorCodes
@@ -62,6 +189,24 @@ namespace Hypervisor
         static_assert(offsetof(COPY_MEMORY_DATA, SourceAddress) == 0x08, "COPY_MEMORY_DATA.SourceAddress ABI mismatch");
         static_assert(offsetof(COPY_MEMORY_DATA, DestinationAddress) == 0x10, "COPY_MEMORY_DATA.DestinationAddress ABI mismatch");
         static_assert(offsetof(COPY_MEMORY_DATA, NumberOfBytes) == 0x18, "COPY_MEMORY_DATA.NumberOfBytes ABI mismatch");
+
+        //
+        // GetDriverInfo (command 0x08): returns the driver's image base/size and its
+        // resolved .text section range.  Written to the caller's user buffer (R8).
+        //
+        typedef struct _DRIVER_INFO
+        {
+            ULONG64 DriverBase;    // 0x00
+            SIZE_T  DriverSize;    // 0x08
+            ULONG64 TextBase;      // 0x10
+            SIZE_T  TextSize;      // 0x18
+        } DRIVER_INFO;
+
+        static_assert(sizeof(DRIVER_INFO) == 32, "DRIVER_INFO ABI mismatch");
+        static_assert(offsetof(DRIVER_INFO, DriverBase) == 0x00, "DRIVER_INFO.DriverBase ABI mismatch");
+        static_assert(offsetof(DRIVER_INFO, DriverSize) == 0x08, "DRIVER_INFO.DriverSize ABI mismatch");
+        static_assert(offsetof(DRIVER_INFO, TextBase) == 0x10, "DRIVER_INFO.TextBase ABI mismatch");
+        static_assert(offsetof(DRIVER_INFO, TextSize) == 0x18, "DRIVER_INFO.TextSize ABI mismatch");
     }
 
     namespace Data
@@ -109,7 +254,7 @@ namespace Hypervisor
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            printf("[!] SEH handler called\n");
+            Console::Fail("VmmCall", "SEH exception (no hypervisor?)");
             output = 0xAABB;
         }
 
@@ -156,6 +301,18 @@ namespace Hypervisor
         return output == Shared::ErrorCodes::Success;
     }
 
+    //
+    // Asks the driver to return the driver's own image base/size and its
+    // resolved .text range into the caller's `info` buffer.  The driver writes
+    // the DRIVER_INFO struct to the R8 pointer and returns Success (0).
+    //
+    inline bool GetDriverInfo(Shared::DRIVER_INFO& info)
+    {
+        const ULONG64 output = CallVM(Shared::MAGIC, Shared::CommandId::GetDriverInfo,
+            reinterpret_cast<ULONG64>(&info));
+        return output == Shared::ErrorCodes::Success;
+    }
+
     /*
      * Forces every active processor through one #VMEXIT.
      *
@@ -167,12 +324,23 @@ namespace Hypervisor
      *
      * Single-threaded on purpose: the shellcode in Data::Shellcode is global
      * state, and a pinned sweep covers every CPU without racing on it.
+     *
+     * Prints nothing: the caller reports one summary line from the counts
+     * returned through `succeeded`/`total` (both optional).
      */
-    inline bool FlushAllProcessors()
+    inline bool FlushAllProcessors(DWORD* succeeded = nullptr, DWORD* total = nullptr)
     {
+        if (succeeded)
+            *succeeded = 0;
+        if (total)
+            *total = 0;
+
         const DWORD processorCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
         if (processorCount == 0)
             return false;
+
+        if (total)
+            *total = processorCount;
 
         const HANDLE thread = GetCurrentThread();
 
@@ -181,6 +349,7 @@ namespace Hypervisor
             return false;
 
         bool allFlushed = true;
+        DWORD flushed = 0;
         for (DWORD index = 0; index < processorCount; index++)
         {
             GROUP_AFFINITY affinity = { 0 };
@@ -190,23 +359,20 @@ namespace Hypervisor
             GROUP_AFFINITY previous = { 0 };
             if (!SetThreadGroupAffinity(thread, &affinity, &previous))
             {
-                printf("[*] flush CPU %lu: pin failed\n", static_cast<unsigned long>(index));
                 allFlushed = false;
                 continue;
             }
 
             if (CallVM(Shared::MAGIC, Shared::CommandId::FlushNpt) != Shared::ErrorCodes::Success)
-            {
-                printf("[*] flush CPU %lu: vmmcall failed\n", static_cast<unsigned long>(index));
                 allFlushed = false;
-            }
             else
-            {
-                printf("[*] flush CPU %lu: ok\n", static_cast<unsigned long>(index));
-            }
+                flushed++;
         }
 
         SetThreadGroupAffinity(thread, &original, nullptr);
+
+        if (succeeded)
+            *succeeded = flushed;
 
         return allFlushed;
     }
@@ -306,11 +472,12 @@ namespace Hypervisor
     /*
      * The copy path resolves through physical page tables, so both the
      * source and the destination of every read/write must be RESIDENT
-     * (present PTEs at every level).  Non-resident chunks (paged out, or
-     * committed but never touched - demand zero) are skipped by the driver:
-     * the request still succeeds, the skipped bytes are simply not
-     * transferred.  Live memory of a running process is always resident;
-     * only freshly allocated, never-touched remote buffers are not.
+     * (present PTEs at every level).  A non-resident page (paged out, or
+     * committed but never touched - demand zero) makes the whole request
+     * fail; nothing is silently skipped, so a caller that receives true can
+     * trust every byte.  Live memory of a running process is always
+     * resident; a freshly allocated, never-touched remote buffer is not, so
+     * touch it before writing to it.
      */
     inline bool WriteMemory(ULONG64 buffer, ULONG64 destination, SIZE_T size)
     {

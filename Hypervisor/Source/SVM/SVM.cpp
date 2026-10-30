@@ -1,5 +1,6 @@
 #include "../Core/Global.h"
 #include "../Common/HVLogs.h"
+#include "Stealth.h"
 
 NTSTATUS SVM::CheckSupport()
 {
@@ -125,6 +126,19 @@ namespace
     //
     void ReleaseNestedPageTables(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 pdPageCount)
     {
+        //
+        // The on-demand PD pool belongs to the tree: it is only useful while
+        // the 2 MB fallback is installed, so it is released with it.
+        //
+        for (ULONG index = 0; index < NPT_SPARE_PD_COUNT; index++)
+        {
+            if (sharedData->SparePdPages[index])
+            {
+                MmFreeContiguousMemory(sharedData->SparePdPages[index]);
+                sharedData->SparePdPages[index] = nullptr;
+            }
+        }
+
         if (sharedData->PdPages)
         {
             for (ULONG64 index = 0; index < pdPageCount; index++)
@@ -151,6 +165,23 @@ namespace
             MmFreeContiguousMemory(sharedData->Pml4Entries);
             sharedData->Pml4Entries = nullptr;
         }
+    }
+}
+}
+
+namespace SVM
+{
+namespace
+{
+    //
+    // PhysicalToVirtual() resolves a physical address to its kernel virtual
+    // address; it is how the #NPF handler reaches the page tables it edits.
+    //
+    PVOID PhysicalToVirtual(const ULONG64 physicalAddress)
+    {
+        PHYSICAL_ADDRESS address;
+        address.QuadPart = static_cast<LONGLONG>(physicalAddress);
+        return MmGetVirtualForPhysical(address);
     }
 }
 }
@@ -241,6 +272,23 @@ void SVM::BuildNestedPageTables(const PSHARED_VIRTUAL_PROCESSOR_DATA sharedData)
         return;
     }
 
+    //
+    // Spare PD pages for the #NPF on-demand mapping path.  The boot-time tree
+    // only covers [0, mappedEnd); a device BAR above that window has no leaf
+    // to restore, so the handler maps the faulting 1 GB region out of this
+    // pool (see MapGpaOnDemand).  Allocated here, before VMRUN, because the
+    // exit path must never allocate.
+    //
+    for (ULONG index = 0; index < NPT_SPARE_PD_COUNT; index++)
+    {
+        sharedData->SparePdPages[index] = static_cast<PD_ENTRY_2MB*>(Utils::AllocatePageAligned(PAGE_SIZE));
+        if (!sharedData->SparePdPages[index])
+        {
+            ReleaseNestedPageTables(sharedData, 0);
+            return;
+        }
+    }
+
     PDPTE_2MB* const pdptEntries = reinterpret_cast<PDPTE_2MB*>(sharedData->PdpEntries);
 
     for (ULONG64 region = 0; region < pdPageCount; region++)
@@ -296,17 +344,67 @@ void SVM::BuildNestedPageTables(const PSHARED_VIRTUAL_PROCESSOR_DATA sharedData)
 }
 
 #if HYPERVISOR_ENABLE_SELF_HIDE
+bool SVM::GetDriverTextRange(ULONG64* textBase, SIZE_T* textSize)
+{
+    *textBase = 0;
+    *textSize = 0;
+
+    if (Global::DriverBase == 0 || Global::DriverSize == 0)
+    {
+        Hypervisor::Log("GetDriverTextRange: DriverBase/DriverSize unknown");
+        return false;
+    }
+
+    const PIMAGE_DOS_HEADER dos = reinterpret_cast<const PIMAGE_DOS_HEADER>(reinterpret_cast<PVOID>(Global::DriverBase));
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) // 0x5A4D ('MZ')
+    {
+        Hypervisor::Log("GetDriverTextRange: not an MZ image");
+        return false;
+    }
+
+    const PIMAGE_NT_HEADERS nt = reinterpret_cast<const PIMAGE_NT_HEADERS>(reinterpret_cast<PVOID>(Global::DriverBase + dos->e_lfanew));
+    if (nt->Signature != IMAGE_NT_SIGNATURE) // 0x00004550 ('PE\0\0')
+    {
+        Hypervisor::Log("GetDriverTextRange: bad PE signature");
+        return false;
+    }
+
+    //
+    // PE32+ optional header magic is 0x20b (the kernel's ntimage.h does not
+    // define a PE32_PLUS_MAGIC constant, so use the literal).
+    //
+    if (nt->OptionalHeader.Magic != 0x20b)
+    {
+        Hypervisor::Log("GetDriverTextRange: unexpected optional header magic");
+        return false;
+    }
+
+    //
+    // The kernel's IMAGE_SECTION_HEADER stores the section's virtual size in
+    // the Misc union member Misc.VirtualSize (not Misc_VirtualSize).
+    //
+    PIMAGE_SECTION_HEADER sections = reinterpret_cast<PIMAGE_SECTION_HEADER>(
+        reinterpret_cast<PUCHAR>(&nt->OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader);
+    for (ULONG32 i = 0; i < nt->FileHeader.NumberOfSections; i++, sections++)
+    {
+        if (_stricmp(reinterpret_cast<const char*>(sections->Name), ".text") == 0)
+        {
+            *textBase = sections->VirtualAddress;
+            *textSize = sections->Misc.VirtualSize;
+            return true;
+        }
+    }
+
+    Hypervisor::Log("GetDriverTextRange: no .text section");
+    return false;
+}
+#endif
+
+#if HYPERVISOR_ENABLE_SELF_HIDE
 namespace SVM
 {
 namespace
 {
-    PVOID PhysicalToVirtual(const ULONG64 physicalAddress)
-    {
-        PHYSICAL_ADDRESS address;
-        address.QuadPart = static_cast<LONGLONG>(physicalAddress);
-        return MmGetVirtualForPhysical(address);
-    }
-
     //
     // Returns the 4 KB page table backing the 2 MB region
     // [pml4Index][pdpIndex][pdIndex], splitting the 1 GB and 2 MB large
@@ -463,6 +561,97 @@ SVM::PT_ENTRY_4KB* SVM::GetPageTableEntry(const SVM::PSHARED_VIRTUAL_PROCESSOR_D
 
     return nullptr;
 #endif
+}
+
+SVM::GpaMapResult SVM::MapGpaOnDemand(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64 gpa)
+{
+    //
+    // Only the 2 MB fallback needs this.  A CPU with 1 GB nested pages maps
+    // the whole 48-bit GPA space in BuildNestedPageTables(), and a GPA past
+    // that has no index in a 4-level tree at all.
+    //
+    if (!sharedData || !sharedData->Pml4Entries || !sharedData->PdpEntries)
+        return GpaMapResult::CannotMap;
+
+    if (Global::Np1GBAvailable || gpa >= NptGpaLimit)
+        return GpaMapResult::CannotMap;
+
+    const ULONG64 pml4Index = gpa >> PML4_PAGE_SHIFT;
+    const ULONG64 pdpIndex = (gpa >> PDP_PAGE_SHIFT) & INDEX_MASK;
+
+    //
+    // The PDPT is one flat 2 MB array, so the 4 KB page for any PML4 index
+    // already exists; only the PML4 entry itself may still be not-present.
+    //
+    PDPTE_2MB* const pdpt = reinterpret_cast<PDPTE_2MB*>(sharedData->PdpEntries) + pml4Index * NptEntryCount;
+
+    if (pdpt[pdpIndex].Present)
+        return GpaMapResult::AlreadyMapped; // Inside the boot window, or another CPU won.
+
+    if (!sharedData->Pml4Entries[pml4Index].Present)
+    {
+        PML4E_64 entry = {};
+        entry.Present = 1;
+        entry.Write = 1;
+        entry.Supervisor = 1;
+        entry.PageFrameNumber = MmGetPhysicalAddress(&pdpt[0]).QuadPart >> PAGE_SHIFT;
+
+        InterlockedExchange64(
+            reinterpret_cast<volatile LONGLONG*>(&sharedData->Pml4Entries[pml4Index].AsUInt),
+            static_cast<LONGLONG>(entry.AsUInt));
+    }
+
+    //
+    // Take one PD page from the boot-time pool.  The pool is never refilled,
+    // so an exhausted pool means "cannot map this region": the caller then
+    // falls through to the unresolved-fault tripwire instead of re-faulting
+    // silently.
+    //
+    const LONG index = InterlockedIncrement(&sharedData->SparePdCursor) - 1;
+    if (index < 0 || index >= static_cast<LONG>(NPT_SPARE_PD_COUNT))
+        return GpaMapResult::CannotMap;
+
+    PD_ENTRY_2MB* const pdPage = sharedData->SparePdPages[index];
+    if (!pdPage)
+        return GpaMapResult::CannotMap;
+
+    //
+    // 512 2 MB large pages mapping this 1 GB region 1:1.  PageFrameNumber is
+    // the 2 MB page number, exactly as BuildNestedPageTables() encodes it.
+    //
+    const ULONG64 regionBase = (pml4Index * NptEntryCount + pdpIndex) * NptOneGB;
+    for (ULONG64 pdIndex = 0; pdIndex < NptEntryCount; pdIndex++)
+    {
+        PD_ENTRY_2MB& pde = pdPage[pdIndex];
+        pde.AsUInt64 = 0;
+        pde.Present = 1;
+        pde.Write = 1;
+        pde.Supervisor = 1;
+        pde.LargePage = 1;
+        pde.PageFrameNumber = (regionBase >> PD_PAGE_SHIFT) + pdIndex;
+    }
+
+    PDPTE_2MB entry = {};
+    entry.Present = 1;
+    entry.Write = 1;
+    entry.Supervisor = 1;
+    entry.LargePage = 0;
+    entry.PageFrameNumber = MmGetPhysicalAddress(pdPage).QuadPart >> PAGE_SHIFT;
+
+    //
+    // Publish with one 64-bit compare-exchange: if another CPU installed the
+    // same region first, its (equivalent, 1:1) mapping stays and this spare
+    // page is simply retired unused.
+    //
+    const LONGLONG expected = 0;
+    if (InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONGLONG*>(&pdpt[pdpIndex].AsUInt),
+            static_cast<LONGLONG>(entry.AsUInt),
+            expected) != expected)
+        return GpaMapResult::AlreadyMapped; // Another CPU published the same 1:1 region.
+
+    Hypervisor::LogNum("NPF: mapped 1GB region on demand, gpa", gpa);
+    return GpaMapResult::MappedNow;
 }
 
 void SVM::TrackForRehide(const PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, SVM::PT_ENTRY_4KB* entry)
@@ -721,7 +910,7 @@ NTSTATUS SVM::HideRange(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG64
                 continue;
 
             InterlockedExchange(reinterpret_cast<volatile LONG*>(&cpu->GuestVmcb.ControlArea.TlbControl), 1);
-            MarkControlAreaDirty(cpu->GuestVmcb.ControlArea);
+            MarkVmcbDirty(cpu->GuestVmcb.ControlArea);
         }
     }
 
@@ -785,7 +974,41 @@ NTSTATUS SVM::ProtectSelf(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData, const ULONG
     sharedData->NptRestoreCount = 0;
     InterlockedExchange(&sharedData->NptRehideEnabled, TRUE);
 
-    const NTSTATUS result = HideRange(sharedData, driverVirtualBase, driverSize, textBase, textSize);
+    //
+    // Self-sufficient range resolution: when the caller supplied no
+    // executable range (textBase == 0 && textSize == 0), resolve the driver's
+    // own .text section from its PE headers at Global::DriverBase.
+    //
+    ULONG64 effTextBase = textBase;
+    SIZE_T effTextSize = textSize;
+    if (effTextBase == 0 && effTextSize == 0)
+    {
+        GetDriverTextRange(&effTextBase, &effTextSize);
+        if (effTextBase != 0)              // parse succeeded
+            effTextBase += Global::DriverBase;   // RVA → absolute VA for HideRange
+    }
+
+    NTSTATUS result;
+    if (effTextBase == 0 || effTextSize == 0)
+    {
+        //
+        // The .text range could not be resolved (headers missing/malformed).
+        // Hiding the whole image would hide .text, and the driver's own
+        // guest-mode code (the process-notify callback, Entry) executes it, so
+        // every one of those instruction fetches would fault.  Hide only the
+        // PE header page - the state a header-stripping mapper already
+        // presents - and leave the rest of the image (including .text) mapped
+        // so the driver stays functional.  GetDriverTextRange already logged
+        // which validation check failed (MZ magic, PE signature, optional
+        // header magic, or no .text section).
+        //
+        Hypervisor::Log("ProtectSelf: .text range unresolvable; hiding PE header page only (fail open)");
+        result = HideRange(sharedData, Global::DriverBase, PAGE_SIZE, 0, 0);
+    }
+    else
+    {
+        result = HideRange(sharedData, driverVirtualBase, driverSize, effTextBase, effTextSize);
+    }
 
     Hypervisor::LogNum("ProtectSelf: HideRange result", result);
 
@@ -854,17 +1077,33 @@ void SVM::DisableSelfHide(PSHARED_VIRTUAL_PROCESSOR_DATA sharedData)
     //
     InterlockedIncrement(&sharedData->NptFlushGeneration);
 
-    PVIRTUAL_PROCESSOR_DATA* const virtualizedCpus = reinterpret_cast<PVIRTUAL_PROCESSOR_DATA*>(Global::VirtualizedCpus);
-    if (virtualizedCpus)
+    //
+    // Safety check: the NPT root must exist before the per-VMCB flush is
+    // requested.  Entry()/HandleExit() only call this once the tree is built,
+    // but a null root here would mean there is nothing to fail open to.
+    //
+    if (!sharedData->Pml4Entries)
+    {
+        Hypervisor::Log("DisableSelfHide: no NPT root; cannot fail open");
+        return;
+    }
+
+    //
+    // Single-view fail-open: the hidden pages were restored above, so every
+    // VMCB just needs a full TLB/NPT flush (TlbControl = 1) at its next VMRUN.
+    // The VMCB is marked dirty so the control-area write is actually consumed.
+    //
+    PVIRTUAL_PROCESSOR_DATA* const cpus = reinterpret_cast<PVIRTUAL_PROCESSOR_DATA*>(Global::VirtualizedCpus);
+    if (cpus)
     {
         for (ULONG cpuIndex = 0; cpuIndex < Global::VirtualizedCpuCount; cpuIndex++)
         {
-            const PVIRTUAL_PROCESSOR_DATA cpu = virtualizedCpus[cpuIndex];
+            const PVIRTUAL_PROCESSOR_DATA cpu = cpus[cpuIndex];
             if (!cpu)
                 continue;
 
             InterlockedExchange(reinterpret_cast<volatile LONG*>(&cpu->GuestVmcb.ControlArea.TlbControl), 1);
-            MarkControlAreaDirty(cpu->GuestVmcb.ControlArea);
+            MarkVmcbDirty(cpu->GuestVmcb.ControlArea);
         }
     }
 
@@ -1090,6 +1329,20 @@ void SVM::PrepareForVirtualization(const PVIRTUAL_PROCESSOR_DATA vpData, const P
     vpData->GuestVmcb.StateSaveArea.Rflags = contextRecord->EFlags;
     vpData->GuestVmcb.StateSaveArea.Rsp = contextRecord->Rsp;
     vpData->GuestVmcb.StateSaveArea.Rip = contextRecord->Rip;
+
+    //
+    // The first VMRUN resumes the instruction after RtlCaptureContext() in
+    // VirtualizeProcessor(), so the VMCB must carry the register state that
+    // was captured there.  RIP/RSP/RFLAGS are set above; RAX gets the same
+    // treatment because it is the only general-purpose register the VMCB
+    // holds at all.  Leaving it at whatever the VMSAVE snapshot (or the
+    // zeroed allocation) left behind would start the resumed code with a
+    // register value that never existed at that program point.  Every other
+    // GPR is outside the VMCB and is not touched by VMRUN, so it still holds
+    // the caller's value.
+    //
+    vpData->GuestVmcb.StateSaveArea.Rax = contextRecord->Rax;
+
     vpData->GuestVmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
 
     vpData->HostStackLayout.Reserved1 = MAXUINT64;
@@ -1146,12 +1399,48 @@ NTSTATUS SVM::VirtualizeProcessor(const PVOID context)
     const int installState = CheckAndSetInstalled();
     if (installState < 0)
     {
+        //
+        // Bookkeeping allocation failed, so this CPU was never marked
+        // installed and neither allocation was published anywhere:
+        // Global::VirtualizedCpus[] is only written below, and no VMRUN has
+        // happened yet on this CPU.  Both frees are therefore safe here.
+        //
         Hypervisor::Log("VirtualizeProcessor: CPU bookkeeping allocation failed");
+        MmFreeContiguousMemory(vpData);
+        ExFreePool(contextRecord);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     if (installState != 0)
+    {
+        //
+        // This branch is reached on the FIRST pass *as the guest*, after
+        // LaunchVM()'s VMRUN resumed at contextRecord->Rip (the instruction
+        // after RtlCaptureContext above) and CheckAndSetInstalled() reported
+        // this CPU as already installed.  The CPU is running under the VMCB
+        // at this point, so NOTHING allocated here may be freed:
+        //
+        //   vpData   - owns the live GuestVmcb (VMCB in use), HostVmcb, the
+        //              HostStateArea whose physical address is in
+        //              MSR_VM_HSAVE_PA, and HostStackLimit[] - the host stack
+        //              LaunchVM() switched RSP to (mov rsp, rcx in
+        //              x64.asm:LaunchVM).  Freeing it makes the next #VMEXIT
+        //              restore host state into freed pool and run HandleExit()
+        //              on a freed stack: a hard freeze with no bugcheck.
+        //              Global::VirtualizedCpus[processorIndex] also points at
+        //              it, and that registry must stay valid for the driver's
+        //              lifetime (see Global.h).
+        //   contextRecord - likewise deliberately not freed here.  It is a
+        //              single CONTEXT-sized allocation per CPU, so leaving it
+        //              resident is a bounded one-time leak that keeps the
+        //              "never free anything reachable after VMRUN" rule
+        //              unconditional and unambiguous.
+        //
+        // The guest must fall through to the caller (ExecuteOnEachProcessor)
+        // so the remaining CPUs are walked.
+        //
         return STATUS_SUCCESS;
+    }
 
     Hypervisor::Log("VirtualizeProcessor: new CPU, preparing VMCB");
 
@@ -1241,6 +1530,17 @@ void SVM::VirtualizeAllProcessors(PVOID)
     Global::VirtualizedCpuCount = processorCount;
 
     //
+    // Per-CPU tracked VM_CR: SVMDIS (bit 4) set by default so a read looks
+    // like "SVM disabled"; only the guest's LOCK bit (bit 5) is ever honored.
+    //
+    Global::SpoofedVmCr = static_cast<PULONG64>(ExAllocatePool(NonPagedPool, processorCount * sizeof(ULONG64)));
+    if (Global::SpoofedVmCr)
+    {
+        for (ULONG cpu = 0; cpu < processorCount; cpu++)
+            Global::SpoofedVmCr[cpu] = (1ULL << 4); // SVMDIS
+    }
+
+    //
     // BuildNestedPageTables() nulls every field it could not complete, so a
     // failure here is a partially built tree.  Detecting it is the whole
     // point of the null contract: VMRUN with a half-built NPT raises an NPF
@@ -1258,6 +1558,16 @@ void SVM::VirtualizeAllProcessors(PVOID)
     }
 
     BuildPermissionMap(sharedVpData->MsrPermissionsMap);
+
+#if HYPERVISOR_STEALTH
+    //
+    // Layer the stealth hardening on top of the base permission map: arm the
+    // CPUID spoofing table and add the performance-counter MSR intercept bits
+    // that BuildPermissionMap does not set.
+    //
+    Stealth::ConfigureCpuidSpoofing();
+    Stealth::ConfigureMsrIntercepts(sharedVpData);
+#endif
 
     const NTSTATUS status = Utils::ExecuteOnEachProcessor(VirtualizeProcessor, sharedVpData);
 

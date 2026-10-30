@@ -68,6 +68,28 @@
 //
 #define HYPERVISOR_ENABLE_SELF_HIDE 1
 
+//
+// NPT design: one shared single-view root
+//
+// This driver has exactly one NPT design: a single shared root that maps
+// guest-physical space 1:1, with HideRange() clearing the Present bit of the
+// pages it hides and the #NPF handler restoring them inline.  The previous
+// dual-view ("clean"/"dirty" root) experiment has been removed: it was
+// structurally broken in several independent ways (the clean root encoded a
+// 1 GB region index in a 2 MB entry's PFN field, the split base was computed
+// with the wrong page size, HideRange() hid pages in the root the #NPF
+// handler then switched *to*, so a hidden page faulted forever, and an
+// out-of-range fault had no tripwire at all).  Keeping a second, unexercised
+// page-table design in the exit path is a correctness hazard, not a feature.
+//
+// HYPERVISOR_STEALTH
+//
+// 1 (default): enable the CPUID/MSR stealth hardening (see Stealth.cpp).
+// 0: every stealth handler becomes a no-op and the original handler
+// behaviour is preserved.
+//
+#define HYPERVISOR_STEALTH 1
+
 namespace Global
 {
     inline PVOID BlankPage = nullptr;
@@ -131,6 +153,15 @@ namespace Global
     // expose NP but not NP_1GB can still virtualize.
     //
     inline bool Np1GBAvailable = false;
+
+    //
+    // Per-CPU tracked VM_CR (SVMDIS + guest-written LOCK).  Initialized to
+    // (1 << 4) (SVMDIS set) at virtualize time; HandleMsrAccess() spoofs the
+    // VM_CR read/write so the guest never sees SVM enabled and no write
+    // reaches real hardware.  Indexed by the system-wide processor index,
+    // clamped to VirtualizedCpuCount.
+    //
+    inline PULONG64 SpoofedVmCr = nullptr;
 
     namespace Offsets
     {

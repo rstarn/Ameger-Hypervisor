@@ -30,7 +30,25 @@ namespace SVM
     // and self-hide is disabled for the whole system.
     //
     constexpr LONG NPT_RESTORE_LIMIT = 32;
-    constexpr LONG NPF_STALE_STRIKE_LIMIT = 32;
+    //
+    // Tightened fail-open thresholds (Part D).  NPF_STALE_STRIKE_LIMIT
+    // 32 -> 8, and the new NPF_UNRESOLVED_LIMIT = 16 replaces the hardcoded
+    // 1000 unresolved-NPF bugcheck tripwire so a stuck fault surfaces sooner
+    // instead of letting a CPU spin silently.
+    //
+    constexpr LONG NPF_STALE_STRIKE_LIMIT = 8;
+    constexpr LONG NPF_UNRESOLVED_LIMIT = 16;
+
+    //
+    // Number of preallocated PD pages reserved for mapping a 1 GB
+    // guest-physical region on demand when the guest faults above the
+    // boot-time NPT window (see SHARED_VIRTUAL_PROCESSOR_DATA::SparePdPages).
+    // Each page covers 1 GB; 32 pages = 32 GB of late-mapped address space,
+    // which is far more than the handful of device apertures a machine
+    // exposes above the window.  The array must keep the shared struct inside
+    // its three page-aligned pages (static_assert in ProcessorData.h).
+    //
+    constexpr ULONG NPT_SPARE_PD_COUNT = 32;
 
     typedef struct _APIC_BASE
     {

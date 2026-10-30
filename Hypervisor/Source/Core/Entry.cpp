@@ -111,6 +111,18 @@ EXTERN_C NTSTATUS Entry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPat
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
+    // Fail closed unless the caller is at PASSIVE_LEVEL.  Everything below
+    // assumes it: PsCreateSystemThread() must be called at PASSIVE_LEVEL, and
+    // KeWaitForSingleObject() on a non-signaled event at DISPATCH_LEVEL is a
+    // bugcheck/hang rather than a wait.  An external mapper is free to invoke
+    // DriverEntry from a raised IRQL, in which case the load would freeze
+    // instead of failing - so refuse it before the first allocation or log
+    // write.  The real loader always calls at PASSIVE_LEVEL.
+    //
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    //
     // Start the log flusher (debug builds only; a production build no-ops).
     //
     Hypervisor::StartLogFlusher();
@@ -274,6 +286,43 @@ EXTERN_C NTSTATUS Entry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPat
 
     if (!NT_SUCCESS(status))
         return status;
+
+    //
+    // Best-effort self-hide: the VirtualizationReady event fires only after
+    // every CPU has been virtualized, so now is the moment to hide the
+    // driver's own image (minus its .text) from the guest's nested page
+    // tables.  A failure here is logged and the load continues - a
+    // functional hypervisor beats a failed load.
+    //
+    // The shared per-CPU state is not a Global::SharedData field; it is
+    // reached through Global::VirtualizedCpus: each slot is a
+    // SVM::PVIRTUAL_PROCESSOR_DATA whose HostStackLayout.SharedVpData points at
+    // the one SVM::SHARED_VIRTUAL_PROCESSOR_DATA that VirtualizeAllProcessors()
+    // allocates.  Slot 0 is the first CPU's record.
+    //
+    SVM::PSHARED_VIRTUAL_PROCESSOR_DATA sharedData = nullptr;
+    if (Global::VirtualizedCpus)
+    {
+        //
+        // Slot 0 can be null when the first CPU failed before publishing its
+        // vpData (CheckAndSetInstalled() allocation failure); dereferencing it
+        // blindly would bugcheck the machine on a path that is already
+        // handling an error.
+        //
+        const SVM::PVIRTUAL_PROCESSOR_DATA firstCpu =
+            reinterpret_cast<SVM::PVIRTUAL_PROCESSOR_DATA*>(Global::VirtualizedCpus)[0];
+        if (firstCpu)
+            sharedData = firstCpu->HostStackLayout.SharedVpData;
+    }
+
+    if (sharedData)
+    {
+        const NTSTATUS hideStatus = SVM::ProtectSelf(sharedData, 0, 0);
+        if (!NT_SUCCESS(hideStatus))
+            Hypervisor::LogNum("Entry: ProtectSelf failed; continuing (best-effort hide)", hideStatus);
+        else
+            Hypervisor::Log("Entry: ProtectSelf complete");
+    }
 
     return virtualizationStatus;
 }

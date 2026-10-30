@@ -194,7 +194,7 @@ void HandleProtectSelf(const SVM::PVIRTUAL_PROCESSOR_DATA vpData, const SVM::PGU
 
     Hypervisor::Log("HandleProtectSelf: ProtectSelf ok, arming TlbControl");
 
-    SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
+    SVM::MarkVmcbDirty(vpData->GuestVmcb.ControlArea);
     vpData->GuestVmcb.ControlArea.TlbControl = 1;
 
     guestContext->VpRegs->Rax = Shared::ErrorCodes::Success;
@@ -219,7 +219,7 @@ void HandleProtectRange(const SVM::PVIRTUAL_PROCESSOR_DATA vpData, const SVM::PG
         return;
     }
 
-    SVM::MarkControlAreaDirty(vpData->GuestVmcb.ControlArea);
+    SVM::MarkVmcbDirty(vpData->GuestVmcb.ControlArea);
     vpData->GuestVmcb.ControlArea.TlbControl = 1;
 
     guestContext->VpRegs->Rax = Shared::ErrorCodes::Success;
@@ -239,62 +239,150 @@ void HandleFlushNpt(const SVM::PVIRTUAL_PROCESSOR_DATA vpData, const SVM::PGUEST
     guestContext->VpRegs->Rax = Shared::ErrorCodes::Success;
 }
 
+void HandleGetDriverInfo(const SVM::PVIRTUAL_PROCESSOR_DATA vpData, const SVM::PGUEST_CONTEXT guestContext)
+{
+    const UINT32 processorIndex = static_cast<UINT32>(vpData->HostStackLayout.ProcessorIndex);
+    const ULONG64 userBuffer = guestContext->VpRegs->R8;
+
+    //
+    // R8 is the caller's user buffer that receives the DRIVER_INFO struct.
+    // Validate it (user space, and leaving room for sizeof(DRIVER_INFO))
+    // before the page walk, mirroring HandleCopyProcessMemory's checks.
+    //
+    if (!Utils::ValidUsermodeAddress(userBuffer) ||
+        userBuffer > Global::HighestUserAddress - sizeof(Shared::DRIVER_INFO))
+    {
+        guestContext->VpRegs->Rax = Shared::ErrorCodes::ControlBlockReadFail;
+        return;
+    }
+
+    const PEPROCESS currentProcess = PsGetCurrentProcess();
+    const ULONG64 currentDirectoryBase = Memory::GetDirectoryBase(currentProcess);
+    if (currentDirectoryBase == 0)
+    {
+        guestContext->VpRegs->Rax = Shared::ErrorCodes::ControlBlockReadFail;
+        return;
+    }
+
+    //
+    // Resolve the driver's own image base/size, then self-sufficiently parse
+    // the driver's PE headers for its .text section (TextBase/TextSize).  On
+    // parse failure the text range stays 0 (fail open).
+    //
+    ULONG64 driverBase = 0;
+    SIZE_T driverSize = 0;
+    if (!NT_SUCCESS(Utils::GetCurrentDriverInfo(&driverBase, &driverSize)))
+    {
+        Hypervisor::Log("HandleGetDriverInfo: driver info unavailable");
+        guestContext->VpRegs->Rax = 0xFFFF;
+        return;
+    }
+
+    Shared::DRIVER_INFO info;
+    info.DriverBase = driverBase;
+    info.DriverSize = driverSize;
+    info.TextBase = 0;
+    info.TextSize = 0;
+#if HYPERVISOR_ENABLE_SELF_HIDE
+    SVM::GetDriverTextRange(&info.TextBase, &info.TextSize);
+#endif
+
+    SIZE_T bytesWritten = 0;
+    const NTSTATUS writeStatus = Memory::WriteProcessMemoryEx(
+        processorIndex, currentDirectoryBase, userBuffer,
+        &info, sizeof(info), &bytesWritten);
+    if (!NT_SUCCESS(writeStatus) || bytesWritten != sizeof(info))
+    {
+        Hypervisor::LogNum("HandleGetDriverInfo: write failed", static_cast<unsigned long long>(writeStatus));
+        guestContext->VpRegs->Rax = 0xFFFF;
+        return;
+    }
+
+    Hypervisor::LogNum("HandleGetDriverInfo: wrote DriverBase", driverBase);
+    guestContext->VpRegs->Rax = Shared::ErrorCodes::Success;
+}
+
 void SVM::HandleVMCall(const PVIRTUAL_PROCESSOR_DATA vpData, const PGUEST_CONTEXT guestContext)
 {
     //
-    // The hypercall interface is a user-mode contract: every command reads
-    // or writes user memory, and the process lookup path requires PASSIVE
-    // IRQL.  A VMMCALL from guest kernel code is not part of the interface
-    // and must not be able to reach the copy path.
+    // 1. Validate the magic (RCX per the VMCALL ABI). A VMMCALL that is not
+    // the intended hyper interface must fault with #UD (AMD APM 24593, p.20).
     //
-    if (!IsInUserland(vpData) || KeGetCurrentIrql() != PASSIVE_LEVEL)
+    const ULONG64 magic = guestContext->VpRegs->Rcx;
+    if (magic != Shared::MAGIC)
     {
-        guestContext->VpRegs->Rax = 0xFFFF;
+        //
+        // #UD is a fault, not a trap: the guest's handler must see RIP at the
+        // VMMCALL, which is what the VMCB already holds after #VMEXIT.  Do
+        // NOT copy NRip here - advancing RIP and injecting #UD at the same
+        // time delivers the exception at the wrong instruction.
+        //
+        InjectUndefinedOpcodeException(vpData);
+        return;
+    }
+
+    const ULONG64 command = guestContext->VpRegs->Rdx;
+
+    if (command == Shared::CheckPresence)
+    {
+        //
+        // CheckPresence is a read-only probe that returns the constant
+        // COMM_CHECK. It exists so a kernel-mode loader (Mapper, running at
+        // CPL0) can detect whether a hypervisor is already installed without
+        // tripping the #UD injection that other non-CPL3 calls cause. The
+        // magic gate above still applies; only a caller that knows the magic
+        // can invoke CheckPresence from ring 0. No state is mutated.
+        //
+        HandleCheckPresence(vpData, guestContext);
         vpData->GuestVmcb.StateSaveArea.Rip = vpData->GuestVmcb.ControlArea.NRip;
         return;
     }
 
-    const ULONG64 magic = guestContext->VpRegs->Rcx;
-    if (magic == Shared::MAGIC)
+    //
+    // 2. Every other command reads or writes user memory and (the process
+    // lookup path) requires PASSIVE IRQL. A VMMCALL from guest kernel code is
+    // not part of the user-mode contract and must fault with #UD rather than
+    // reach the copy path.
+    //
+    if (!IsInUserland(vpData) || KeGetCurrentIrql() != PASSIVE_LEVEL)
     {
-        const ULONG64 command = guestContext->VpRegs->Rdx;
-        switch (command)
-        {
-        case Shared::CheckPresence:
-            HandleCheckPresence(vpData, guestContext);
-            break;
-        case Shared::GetProcess:
-            HandleGetProcess(vpData, guestContext);
-            break;
-        case Shared::GetDirectoryBase:
-            HandleGetDirectoryBase(vpData, guestContext);
-            break;
-        case Shared::CopyProcessMemory:
-            HandleCopyProcessMemory(vpData, guestContext);
-            break;
-        case Shared::ProtectSelf:
-            HandleProtectSelf(vpData, guestContext);
-            break;
-        case Shared::ProtectRange:
-            HandleProtectRange(vpData, guestContext);
-            break;
-        case Shared::FlushNpt:
-            HandleFlushNpt(vpData, guestContext);
-            break;
-        default:
-            HandleInvalid(vpData, guestContext);
-            break;
-        }
-    }
-    else
-    {
-        /*
-         * PR #15: a VMMCALL from code that is not the intended hyper
-         * interface is not supported in the current context and must fault
-         * with #UD (AMD APM 24593, page 20).
-         */
+        //
+        // Same fault semantics as above: the injected #UD must be delivered
+        // at the VMMCALL, so RIP stays where #VMEXIT left it.
+        //
         InjectUndefinedOpcodeException(vpData);
         return;
+    }
+
+    //
+    // 3. Normal dispatch for the CPL3 + PASSIVE commands.
+    //
+    switch (command)
+    {
+    case Shared::GetProcess:
+        HandleGetProcess(vpData, guestContext);
+        break;
+    case Shared::GetDirectoryBase:
+        HandleGetDirectoryBase(vpData, guestContext);
+        break;
+    case Shared::CopyProcessMemory:
+        HandleCopyProcessMemory(vpData, guestContext);
+        break;
+    case Shared::ProtectSelf:
+        HandleProtectSelf(vpData, guestContext);
+        break;
+    case Shared::ProtectRange:
+        HandleProtectRange(vpData, guestContext);
+        break;
+    case Shared::FlushNpt:
+        HandleFlushNpt(vpData, guestContext);
+        break;
+    case Shared::GetDriverInfo:
+        HandleGetDriverInfo(vpData, guestContext);
+        break;
+    default:
+        HandleInvalid(vpData, guestContext);
+        break;
     }
 
     vpData->GuestVmcb.StateSaveArea.Rip = vpData->GuestVmcb.ControlArea.NRip;
